@@ -92,14 +92,19 @@ touch ./data/paqus/STOP
 
 ## Transactions
 
+Send with the short command:
+
+```bash
+cargo run -- wallet pay <recipient-address-hex> 10
+```
+
 Create a signed transaction and print it as hex:
 
 ```bash
 cargo run -- wallet send \
   --wallet wallet.json \
-  --to <address-tujuan-hex> \
-  --amount 10 \
-  --nonce 0
+  --to <recipient-address-hex> \
+  --amount 10
 ```
 
 Create and submit a signed transaction to the default RPC:
@@ -107,9 +112,8 @@ Create and submit a signed transaction to the default RPC:
 ```bash
 cargo run -- wallet send \
   --wallet wallet.json \
-  --to <address-tujuan-hex> \
+  --to <recipient-address-hex> \
   --amount 10 \
-  --nonce 0 \
   --submit
 ```
 
@@ -118,9 +122,8 @@ Create and submit to a custom RPC address:
 ```bash
 cargo run -- wallet send \
   --wallet wallet.json \
-  --to <address-tujuan-hex> \
+  --to <recipient-address-hex> \
   --amount 10 \
-  --nonce 0 \
   --submit \
   --rpc 127.0.0.1:9933
 ```
@@ -130,9 +133,19 @@ Set a custom fee:
 ```bash
 cargo run -- wallet send \
   --wallet wallet.json \
-  --to <address-tujuan-hex> \
+  --to <recipient-address-hex> \
   --amount 10 \
   --fee 2 \
+  --submit
+```
+
+Set nonce manually if needed:
+
+```bash
+cargo run -- wallet send \
+  --wallet wallet.json \
+  --to <recipient-address-hex> \
+  --amount 10 \
   --nonce 0 \
   --submit
 ```

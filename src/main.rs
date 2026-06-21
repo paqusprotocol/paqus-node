@@ -118,9 +118,46 @@ fn wallet_command(args: &[String]) -> Result<(), String> {
             println!("{}", balance_json(&node, &address));
             Ok(())
         }
+        Some("pay") => wallet_pay_command(&args[1..]),
         Some("send") => wallet_send_command(&args[1..]),
-        _ => Err("usage: paqus wallet <new|address|balance|send> [options]".to_string()),
+        _ => Err("usage: paqus wallet <new|address|balance|pay|send> [options]".to_string()),
     }
+}
+
+fn wallet_pay_command(args: &[String]) -> Result<(), String> {
+    let to = parse_address(args.first())?;
+    let amount = parse_amount(args.get(1), "amount")?;
+    let mut wallet_path = "wallet.json".to_string();
+    let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
+    let mut fee = Amount(BASE_FEE);
+    let mut index = 2;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            "--fee" => {
+                index += 1;
+                fee = parse_amount(args.get(index), "--fee")?;
+            }
+            value => return Err(format!("unknown wallet pay option `{value}`")),
+        }
+        index += 1;
+    }
+
+    submit_wallet_payment(&wallet_path, to, amount, fee, None, &rpc_addr)
 }
 
 fn wallet_send_command(args: &[String]) -> Result<(), String> {
@@ -171,8 +208,31 @@ fn wallet_send_command(args: &[String]) -> Result<(), String> {
     let wallet_path = wallet_path.ok_or_else(|| "missing --wallet path".to_string())?;
     let to = to.ok_or_else(|| "missing --to address".to_string())?;
     let amount = amount.ok_or_else(|| "missing --amount".to_string())?;
-    let nonce = nonce.ok_or_else(|| "missing --nonce".to_string())?;
-    let wallet = load_wallet(&wallet_path)?;
+    submit_wallet_transaction(&wallet_path, to, amount, fee, nonce, &rpc_addr, submit)
+}
+
+fn submit_wallet_payment(
+    wallet_path: &str,
+    to: Address,
+    amount: Amount,
+    fee: Amount,
+    nonce: Option<Nonce>,
+    rpc_addr: &str,
+) -> Result<(), String> {
+    submit_wallet_transaction(wallet_path, to, amount, fee, nonce, rpc_addr, true)
+}
+
+fn submit_wallet_transaction(
+    wallet_path: &str,
+    to: Address,
+    amount: Amount,
+    fee: Amount,
+    nonce: Option<Nonce>,
+    rpc_addr: &str,
+    submit: bool,
+) -> Result<(), String> {
+    let wallet = load_wallet(wallet_path)?;
+    let nonce = nonce.unwrap_or(resolve_wallet_nonce(&wallet.address, rpc_addr)?);
     let transaction = Transaction::new(wallet.address, to, amount, fee, nonce);
     let signed = wallet
         .sign_transaction(transaction)
@@ -256,6 +316,22 @@ struct RunConfig {
 struct WalletFile {
     address: String,
     secret_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceRpcResponse {
+    nonce: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MempoolRpcResponse {
+    transactions: Vec<MempoolTxRpcResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MempoolTxRpcResponse {
+    from: String,
+    nonce: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1663,6 +1739,35 @@ fn parse_nonce(value: Option<&String>) -> Result<Nonce, String> {
         .map_err(|error| format!("invalid nonce: {error}"))
 }
 
+fn resolve_wallet_nonce(address: &Address, rpc_addr: &str) -> Result<Nonce, String> {
+    let address_hex = address_to_string(address);
+    let balance_body = http_get(rpc_addr, &format!("/balance/{address_hex}"))?;
+    let balance: BalanceRpcResponse = serde_json::from_str(&balance_body)
+        .map_err(|error| format!("failed to parse balance rpc response: {error}"))?;
+    let mut next_nonce = balance.nonce.unwrap_or(0);
+
+    let mempool_body = http_get(rpc_addr, "/mempool")?;
+    let mempool: MempoolRpcResponse = serde_json::from_str(&mempool_body)
+        .map_err(|error| format!("failed to parse mempool rpc response: {error}"))?;
+    let mut pending_nonces = mempool
+        .transactions
+        .into_iter()
+        .filter_map(|transaction| (transaction.from == address_hex).then_some(transaction.nonce))
+        .collect::<Vec<_>>();
+    pending_nonces.sort_unstable();
+    pending_nonces.dedup();
+
+    for nonce in pending_nonces {
+        if nonce == next_nonce {
+            next_nonce = next_nonce.saturating_add(1);
+        } else if nonce > next_nonce {
+            break;
+        }
+    }
+
+    Ok(Nonce(next_nonce))
+}
+
 fn signed_transaction_to_hex(transaction: &SignedTransaction) -> Result<String, String> {
     borsh::to_vec(transaction)
         .map(hex::encode)
@@ -1687,6 +1792,27 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Result<String, String> 
         body.len(),
         body
     );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("failed to write rpc request: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("failed to read rpc response: {error}"))?;
+    Ok(response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(response))
+}
+
+fn http_get(addr: &str, path: &str) -> Result<String, String> {
+    let addr = addr
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid rpc address: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|error| format!("failed to connect rpc: {error}"))?;
+    configure_stream(&stream, Duration::from_secs(5))?;
+    let request = format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|error| format!("failed to write rpc request: {error}"))?;
@@ -1763,7 +1889,8 @@ Usage:
   paqus wallet new [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address-hex> [db-path]
-  paqus wallet send --wallet path --to address-hex --amount units --nonce n [--fee units] [--submit] [--rpc addr]
+  paqus wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc addr]
+  paqus wallet send --wallet path --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc addr]
 
 RPC:
   GET  /status
