@@ -1,5 +1,32 @@
 # Paqus Node Commands
 
+## Interactive CLI
+
+Open the menu:
+
+```bash
+cargo run
+```
+
+Or explicitly:
+
+```bash
+cargo run -- menu
+```
+
+Menu:
+
+```text
+1. Create wallet
+2. Import wallet
+3. Run node
+4. Check balance
+5. Send
+6. Receive
+7. Mini explorer
+8. Exit
+```
+
 ## Wallet
 
 Create a new wallet:
@@ -40,6 +67,18 @@ Show network info:
 cargo run -- node info
 ```
 
+Create the default node config:
+
+```bash
+cargo run -- node config
+```
+
+After editing `./data/paqus/node.json` once, run with saved settings:
+
+```bash
+cargo run -- node run
+```
+
 Initialize the default node database:
 
 ```bash
@@ -62,10 +101,30 @@ Run node with custom P2P and RPC addresses:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen 0.0.0.0:30333 \
+  --listen [2404:8000:1044:4d8:822b:f9ff:fee2:365]:30333 \
   --rpc-listen 127.0.0.1:9933 \
   --wallet wallet.json \
   --mine
+```
+
+Or save those values once in `./data/paqus/node.json`:
+
+```json
+{
+  "db_path": "./data/paqus",
+  "listen_addr": "0.0.0.0:30333",
+  "rpc_addr": "127.0.0.1:9933",
+  "peers": [],
+  "peers_file": "./data/paqus/peers.txt",
+  "shutdown_file": "./data/paqus/STOP",
+  "max_peers": 128,
+  "wallet": "wallet.json",
+  "miner_address": null,
+  "miner_secret_key": null,
+  "mine": true,
+  "mine_interval_secs": 300,
+  "mine_attempts": 10000
+}
 ```
 
 Connect to a peer:

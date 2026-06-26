@@ -1,3 +1,11 @@
+mod gossip;
+mod libp2p_node;
+mod mempool;
+mod network;
+mod p2p;
+mod paquscore;
+mod runtime;
+
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, State},
@@ -6,27 +14,27 @@ use axum::{
     routing::{get, post},
 };
 use borsh::BorshDeserialize;
-use paqus::block::Block;
-use paqus::consensus::Consensus;
-use paqus::crypto::{address_to_string, derive_public_key};
-use paqus::genesis::GENESIS_PREMINE_ADDRESS;
-use paqus::network::{
-    NetworkMessage, PeerInfo, TipInfo, VersionInfo, handle_message, read_message, write_message,
+use gossip::broadcast_to_peers;
+use mempool::resolve_wallet_nonce;
+use network::{bind_nonblocking, configure_stream, http_get, http_post_json, send_message};
+use p2p::{PeerPoll, PeerState, dedupe_peers, load_peers_file, poll_peer, request_peers};
+use paquscore::{
+    Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
+    NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction, Transaction, Wallet,
+    address_from_public_key, address_to_string, derive_public_key, handle_message, read_message,
+    write_message,
 };
-use paqus::node::Node;
-use paqus::params::{
-    BASE_FEE, BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME,
-    DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, NETWORK_MAGIC,
-    PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
+use paquscore::{
+    BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME,
+    DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, MIN_FEE,
+    NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
 };
-use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, Height, Nonce, SecretKey};
-use paqus::wallet::Wallet;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
+use std::io::Write as IoWrite;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -36,11 +44,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_NODE_DB: &str = "./data/paqus";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:30333";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:9933";
+const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
-const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
-const PEER_RETRY_BASE: Duration = Duration::from_secs(2);
-const PEER_RETRY_MAX: Duration = Duration::from_secs(60);
-const MAX_BLOCKS_PER_SYNC: u64 = 64;
 const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
 
@@ -56,7 +61,8 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        None | Some("-h") | Some("--help") | Some("help") => {
+        None => interactive_menu(),
+        Some("-h") | Some("--help") | Some("help") => {
             print_help();
             Ok(())
         }
@@ -66,8 +72,223 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Some("wallet") => wallet_command(&args[1..]),
         Some("node") => node_command(&args[1..]),
+        Some("menu") | Some("cli") => interactive_menu(),
         Some(command) => Err(format!("unknown command `{command}`. Try `paqus --help`.")),
     }
+}
+
+fn interactive_menu() -> Result<(), String> {
+    loop {
+        println!();
+        println!("Paqus Node CLI");
+        println!("1. Create wallet");
+        println!("2. Import wallet");
+        println!("3. Run node");
+        println!("4. Check balance");
+        println!("5. Send");
+        println!("6. Receive");
+        println!("7. Explorer");
+        println!("8. Exit");
+
+        match prompt("Select menu")?.as_str() {
+            "1" => menu_create_wallet()?,
+            "2" => menu_import_wallet()?,
+            "3" => {
+                println!(
+                    "Starting node. Press Ctrl+C to stop, or create the STOP file from another terminal."
+                );
+                return run_node(&[]);
+            }
+            "4" => menu_check_balance()?,
+            "5" => menu_send()?,
+            "6" => menu_receive()?,
+            "7" => menu_explorer()?,
+            "8" => return Ok(()),
+            value => println!("Unknown menu `{value}`"),
+        }
+    }
+}
+
+fn menu_create_wallet() -> Result<(), String> {
+    let path = prompt_default("Wallet file", "wallet.json")?;
+    if std::path::Path::new(&path).exists() && !prompt_yes_no("File exists. Overwrite?")? {
+        return Ok(());
+    }
+    let wallet = Wallet::generate();
+    save_wallet_file(&path, &wallet)?;
+    println!("wallet: {path}");
+    println!("address: {}", wallet.wallet_address());
+    Ok(())
+}
+
+fn menu_import_wallet() -> Result<(), String> {
+    let secret_key = parse_secret_key(Some(&prompt("Secret key hex")?))?;
+    let wallet = Wallet::from_secret_key(secret_key);
+    let path = prompt_default("Wallet file", "wallet.json")?;
+    if std::path::Path::new(&path).exists() && !prompt_yes_no("File exists. Overwrite?")? {
+        return Ok(());
+    }
+    save_wallet_file(&path, &wallet)?;
+    println!("wallet imported: {path}");
+    println!("address: {}", wallet.wallet_address());
+    Ok(())
+}
+
+fn menu_check_balance() -> Result<(), String> {
+    let address = match choose_wallet("Select wallet for balance")? {
+        Some((_, wallet)) => wallet.address,
+        None => parse_address(Some(&prompt("Address hex")?))?,
+    };
+    let db_path = prompt_default("Node DB path", DEFAULT_NODE_DB)?;
+    let node = open_node(&db_path, Address([9; 20]))?;
+    println!("{}", balance_json(&node, &address));
+    Ok(())
+}
+
+fn menu_send() -> Result<(), String> {
+    let Some((wallet_path, _)) = choose_wallet("Select wallet to send from")? else {
+        println!("No wallet selected.");
+        return Ok(());
+    };
+    let to = parse_address(Some(&prompt("Recipient address")?))?;
+    let amount = parse_amount(Some(&prompt("Amount")?), "amount")?;
+    let fee = parse_amount(Some(&prompt_default("Fee", &MIN_FEE.to_string())?), "fee")?;
+    let rpc_addr = prompt_default("RPC address", DEFAULT_RPC_ADDR)?;
+    submit_wallet_payment(&wallet_path, to, amount, fee, None, &rpc_addr)
+}
+
+fn menu_receive() -> Result<(), String> {
+    let wallets = discover_wallets();
+    if wallets.is_empty() {
+        println!("No wallet files found. Create or import a wallet first.");
+        return Ok(());
+    }
+    if wallets.len() == 1 {
+        println!("{}", wallets[0].1.wallet_address());
+        return Ok(());
+    }
+    for (index, (path, wallet)) in wallets.iter().enumerate() {
+        println!("{}. {} ({})", index + 1, wallet.wallet_address(), path);
+    }
+    let choice = prompt("Select address")?;
+    let index = choice
+        .parse::<usize>()
+        .map_err(|error| format!("invalid selection: {error}"))?
+        .checked_sub(1)
+        .ok_or_else(|| "invalid selection".to_string())?;
+    let Some((_, wallet)) = wallets.get(index) else {
+        return Err("invalid selection".to_string());
+    };
+    println!("{}", wallet.wallet_address());
+    Ok(())
+}
+
+fn menu_explorer() -> Result<(), String> {
+    let address = match choose_wallet("Select wallet/address for transactions")? {
+        Some((_, wallet)) => wallet.address,
+        None => parse_address(Some(&prompt("Address hex")?))?,
+    };
+    let rpc_addr = prompt_default("RPC address", DEFAULT_RPC_ADDR)?;
+    let body = http_get(
+        &rpc_addr,
+        &format!("/address/{}", address_to_string(&address)),
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse explorer response: {error}"))?;
+    let transactions = value
+        .get("transactions")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&transactions)
+            .map_err(|error| format!("failed to render transactions: {error}"))?
+    );
+    Ok(())
+}
+
+fn choose_wallet(label: &str) -> Result<Option<(String, Wallet)>, String> {
+    let wallets = discover_wallets();
+    if wallets.is_empty() {
+        return Ok(None);
+    }
+    println!("{label}");
+    for (index, (path, wallet)) in wallets.iter().enumerate() {
+        println!("{}. {} ({})", index + 1, wallet.wallet_address(), path);
+    }
+    println!("{}. Manual address", wallets.len() + 1);
+    let choice = prompt("Select")?;
+    let index = choice
+        .parse::<usize>()
+        .map_err(|error| format!("invalid selection: {error}"))?;
+    if index == wallets.len() + 1 {
+        return Ok(None);
+    }
+    wallets
+        .get(index.saturating_sub(1))
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| "invalid selection".to_string())
+}
+
+fn discover_wallets() -> Vec<(String, Wallet)> {
+    let mut wallets = Vec::new();
+    for dir in [".", "./data/paqus"] {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if let Ok(wallet) = load_wallet(&path_str) {
+                wallets.push((path_str, wallet));
+            }
+        }
+    }
+    wallets.sort_by(|left, right| left.0.cmp(&right.0));
+    wallets.dedup_by(|left, right| left.0 == right.0);
+    wallets
+}
+
+fn save_wallet_file(path: &str, wallet: &Wallet) -> Result<(), String> {
+    let json_data = serde_json::json!({
+        "address": wallet.wallet_address(),
+        "public_key": hex::encode(wallet.public_key.0),
+        "secret_key": hex::encode(wallet.secret_key.0),
+    });
+    let json_str = serde_json::to_string_pretty(&json_data)
+        .map_err(|error| format!("failed to serialize wallet: {error}"))?;
+    fs::write(path, json_str)
+        .map_err(|error| format!("failed to write wallet file `{path}`: {error}"))
+}
+
+fn prompt(label: &str) -> Result<String, String> {
+    print!("{label}: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush stdout: {error}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("failed to read input: {error}"))?;
+    Ok(line.trim().to_string())
+}
+
+fn prompt_default(label: &str, default: &str) -> Result<String, String> {
+    let value = prompt(&format!("{label} [{default}]"))?;
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value)
+    }
+}
+
+fn prompt_yes_no(label: &str) -> Result<bool, String> {
+    let value = prompt(&format!("{label} [y/N]"))?;
+    Ok(matches!(value.to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
 fn wallet_command(args: &[String]) -> Result<(), String> {
@@ -107,7 +328,7 @@ fn wallet_command(args: &[String]) -> Result<(), String> {
         Some("address") => {
             let secret_key = parse_secret_key(args.get(1))?;
             let public_key = derive_public_key(&secret_key);
-            let address = paqus::crypto::address_from_public_key(&public_key);
+            let address = address_from_public_key(&public_key);
             println!("{}", address_to_string(&address));
             Ok(())
         }
@@ -129,7 +350,7 @@ fn wallet_pay_command(args: &[String]) -> Result<(), String> {
     let amount = parse_amount(args.get(1), "amount")?;
     let mut wallet_path = "wallet.json".to_string();
     let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
-    let mut fee = Amount(BASE_FEE);
+    let mut fee = Amount(MIN_FEE);
     let mut index = 2;
 
     while index < args.len() {
@@ -164,7 +385,7 @@ fn wallet_send_command(args: &[String]) -> Result<(), String> {
     let mut wallet_path = None;
     let mut to = None;
     let mut amount = None;
-    let mut fee = Amount(BASE_FEE);
+    let mut fee = Amount(MIN_FEE);
     let mut nonce = None;
     let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
     let mut submit = false;
@@ -282,11 +503,16 @@ fn node_command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("run") => run_node(&args[1..]),
+        Some("config") => node_config_command(&args[1..]),
+        Some("libp2p-info") => {
+            print_libp2p_info()?;
+            Ok(())
+        }
         Some("info") => {
             print_network_info();
             Ok(())
         }
-        _ => Err("usage: paqus node <info|init|run> [options]".to_string()),
+        _ => Err("usage: paqus node <info|libp2p-info|init|config|run> [options]".to_string()),
     }
 }
 
@@ -294,6 +520,17 @@ fn open_node(path: &str, miner_address: Address) -> Result<Node, String> {
     let _ = miner_address;
     Node::init_or_load(path, Consensus::with_default_config())
         .map_err(|error| format!("failed to open node storage: {error}"))
+}
+
+fn node_config_command(args: &[String]) -> Result<(), String> {
+    let path = args
+        .first()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_CONFIG_FILE);
+    write_default_run_config(path)?;
+    println!("node config written: {path}");
+    println!("run with: cargo run -- node run");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -312,26 +549,27 @@ struct RunConfig {
     mine_attempts: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunConfigFile {
+    db_path: String,
+    listen_addr: String,
+    rpc_addr: String,
+    peers: Vec<String>,
+    peers_file: Option<String>,
+    shutdown_file: String,
+    max_peers: usize,
+    wallet: Option<String>,
+    miner_address: Option<String>,
+    miner_secret_key: Option<String>,
+    mine: bool,
+    mine_interval_secs: u64,
+    mine_attempts: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct WalletFile {
     address: String,
     secret_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BalanceRpcResponse {
-    nonce: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MempoolRpcResponse {
-    transactions: Vec<MempoolTxRpcResponse>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MempoolTxRpcResponse {
-    from: String,
-    nonce: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -485,38 +723,24 @@ impl Default for RunConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PeerState {
-    addr: SocketAddr,
-    failures: u32,
-    next_attempt: Instant,
-    last_tip: Option<Height>,
-}
-
-impl PeerState {
-    fn new(addr: SocketAddr) -> Self {
+impl Default for RunConfigFile {
+    fn default() -> Self {
+        let defaults = RunConfig::default();
         Self {
-            addr,
-            failures: 0,
-            next_attempt: Instant::now(),
-            last_tip: None,
+            db_path: defaults.db_path,
+            listen_addr: defaults.listen_addr.to_string(),
+            rpc_addr: defaults.rpc_addr.to_string(),
+            peers: Vec::new(),
+            peers_file: Some("./data/paqus/peers.txt".to_string()),
+            shutdown_file: defaults.shutdown_file,
+            max_peers: defaults.max_peers,
+            wallet: None,
+            miner_address: None,
+            miner_secret_key: None,
+            mine: false,
+            mine_interval_secs: defaults.mine_interval.as_secs(),
+            mine_attempts: defaults.mine_attempts,
         }
-    }
-
-    fn mark_ok(&mut self, tip: Option<Height>) {
-        self.failures = 0;
-        self.last_tip = tip;
-        self.next_attempt = Instant::now() + DEFAULT_SYNC_INTERVAL;
-    }
-
-    fn mark_failed(&mut self) {
-        self.failures = self.failures.saturating_add(1);
-        let shift = self.failures.saturating_sub(1).min(5);
-        let secs = PEER_RETRY_BASE
-            .as_secs()
-            .saturating_mul(1_u64 << shift)
-            .min(PEER_RETRY_MAX.as_secs());
-        self.next_attempt = Instant::now() + Duration::from_secs(secs);
     }
 }
 
@@ -570,7 +794,7 @@ impl NodeService {
                     .to_string()
             })?;
             let public_key = derive_public_key(&secret_key);
-            let derived_address = paqus::crypto::address_from_public_key(&public_key);
+            let derived_address = address_from_public_key(&public_key);
             if derived_address != self.config.miner_address {
                 return Err(format!(
                     "miner secret key does not match miner address {}",
@@ -630,7 +854,7 @@ impl NodeService {
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
         println!(
-            "preflight ok height={} tip={} difficulty={} mempool={} mining={}",
+            "preflight ok |height::{}|tip::{}|difficulty::{}|mempool::{}|mining::{}",
             node.tip_height().unwrap_or(Height(0)).0,
             short_hash(node.tip_hash()),
             format_difficulty(node.next_difficulty()),
@@ -676,7 +900,7 @@ impl NodeService {
                     .map_err(|_| "peer state lock poisoned".to_string())?
                     .len();
                 println!(
-                    "status height={} tip={} difficulty={} mempool={} peers={} mining={}",
+                    "status: |height::{}|tip::{}|difficulty::{}|mempool::{}|peers::{}|mining::{}",
                     node.tip_height().unwrap_or(Height(0)).0,
                     short_hash(node.tip_hash()),
                     format_difficulty(node.next_difficulty()),
@@ -1058,8 +1282,9 @@ async fn rpc_block_by_hash(
         Ok(hash) => hash,
         Err(error) => return rpc_error(StatusCode::BAD_REQUEST, error),
     };
+    let block_hash = BlockHash::from(hash);
     match state.node.lock() {
-        Ok(node) => match node.storage.load_block_by_hash(&hash) {
+        Ok(node) => match node.storage.load_block_by_hash(&block_hash) {
             Ok(Some(block)) => Json(block_response(&block, None)).into_response(),
             Ok(None) => rpc_error(StatusCode::NOT_FOUND, "block_not_found"),
             Err(error) => rpc_error(
@@ -1207,21 +1432,6 @@ fn rpc_error(status: StatusCode, error: impl Into<String>) -> axum::response::Re
         .into_response()
 }
 
-fn broadcast_to_peers(peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>, message: NetworkMessage) {
-    let peers = match peers.lock() {
-        Ok(peers) => peers.keys().copied().collect::<Vec<_>>(),
-        Err(_) => {
-            eprintln!("peer state lock poisoned");
-            return;
-        }
-    };
-    for peer in peers {
-        if let Err(error) = send_message(peer, message.clone()) {
-            eprintln!("broadcast to {peer} failed: {error}");
-        }
-    }
-}
-
 fn block_response(block: &Block, status: Option<&'static str>) -> BlockResponse {
     let block_hash = block.hash();
     BlockResponse {
@@ -1258,7 +1468,7 @@ fn block_response(block: &Block, status: Option<&'static str>) -> BlockResponse 
                 tx_response(
                     transaction,
                     Some(block.height()),
-                    Some(block_hash),
+                    Some(block_hash.into()),
                     status.unwrap_or("confirmed"),
                 )
             })
@@ -1269,7 +1479,7 @@ fn block_response(block: &Block, status: Option<&'static str>) -> BlockResponse 
 fn tx_response(
     transaction: &SignedTransaction,
     block_height: Option<Height>,
-    block_hash: Option<paqus::types::Hash>,
+    block_hash: Option<Hash>,
     status: &'static str,
 ) -> TxResponse {
     TxResponse {
@@ -1285,7 +1495,7 @@ fn tx_response(
     }
 }
 
-fn find_transaction(node: &Node, hash: &paqus::types::Hash) -> Result<Option<TxResponse>, String> {
+fn find_transaction(node: &Node, hash: &Hash) -> Result<Option<TxResponse>, String> {
     for transaction in node.mempool.transactions() {
         if transaction.hash() == *hash {
             return Ok(Some(tx_response(transaction, None, None, "pending")));
@@ -1306,7 +1516,7 @@ fn find_transaction(node: &Node, hash: &paqus::types::Hash) -> Result<Option<TxR
                 return Ok(Some(tx_response(
                     transaction,
                     Some(block.height()),
-                    Some(block.hash()),
+                    Some(block.hash().into()),
                     "confirmed",
                 )));
             }
@@ -1331,7 +1541,7 @@ fn address_transactions(node: &Node, address: &Address) -> Result<Vec<TxResponse
                 transactions.push(tx_response(
                     transaction,
                     Some(block.height()),
-                    Some(block.hash()),
+                    Some(block.hash().into()),
                     "confirmed",
                 ));
             }
@@ -1380,7 +1590,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
 
     println!(
-        "paqus node running db={} p2p={} rpc={} height={} tip={} difficulty={} peers={} mining={}",
+        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}",
         service.config.db_path,
         listen_addr,
         service.config.rpc_addr,
@@ -1402,7 +1612,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
 
 fn print_core_startup_info() {
     println!(
-        "core chain={} chain_id={} coin={} stage={} protocol={} storage={} magic={}",
+        "core chain::{}|chain_id::{}|coin::{}|stage::{}|protocol::{}|storage::{}|magic::{}",
         CHAIN_NAME,
         CHAIN_ID,
         COIN_NAME,
@@ -1412,7 +1622,7 @@ fn print_core_startup_info() {
         hex::encode(NETWORK_MAGIC)
     );
     println!(
-        "consensus block_time={}s finality={} reward_maturity={} difficulty_start={} retarget_window={}",
+        "consensus: block_time::{}s|finality::{}|reward_maturity::{}|difficulty_start::{}|retarget_window::{}",
         BLOCK_TIME,
         FINALITY_DEPTH,
         BLOCK_REWARD_MATURITY,
@@ -1421,21 +1631,21 @@ fn print_core_startup_info() {
     );
 }
 
-fn bind_nonblocking(addr: SocketAddr, label: &str) -> Result<TcpListener, String> {
-    let listener = TcpListener::bind(addr)
-        .map_err(|error| format!("failed to bind {label} {addr}: {error}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("failed to set {label} listener nonblocking: {error}"))?;
-    Ok(listener)
-}
-
 fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
     let mut config = RunConfig::default();
+    let config_path = config_path_arg(args).unwrap_or(DEFAULT_CONFIG_FILE);
+    if let Some(file_config) = load_run_config_file_if_exists(config_path)? {
+        apply_run_config_file(&mut config, file_config)?;
+    }
     let mut index = 0;
 
     while index < args.len() {
         match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                args.get(index)
+                    .ok_or_else(|| "missing value for --config".to_string())?;
+            }
             "--db" | "--db-path" => {
                 index += 1;
                 config.db_path = args
@@ -1525,6 +1735,70 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
     Ok(config)
 }
 
+fn config_path_arg(args: &[String]) -> Option<&str> {
+    args.windows(2)
+        .find_map(|window| (window[0] == "--config").then_some(window[1].as_str()))
+}
+
+fn write_default_run_config(path: &str) -> Result<(), String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create config directory: {error}"))?;
+    }
+    let contents = serde_json::to_string_pretty(&RunConfigFile::default())
+        .map_err(|error| format!("failed to encode default config: {error}"))?;
+    fs::write(path, contents).map_err(|error| format!("failed to write config {path}: {error}"))
+}
+
+fn load_run_config_file_if_exists(path: &str) -> Result<Option<RunConfigFile>, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read config {path}: {error}")),
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .map_err(|error| format!("failed to parse config {path}: {error}"))
+}
+
+fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<(), String> {
+    config.db_path = file.db_path;
+    config.listen_addr = file
+        .listen_addr
+        .parse()
+        .map_err(|error| format!("invalid listen_addr in config: {error}"))?;
+    config.rpc_addr = file
+        .rpc_addr
+        .parse()
+        .map_err(|error| format!("invalid rpc_addr in config: {error}"))?;
+    config.peers = file
+        .peers
+        .into_iter()
+        .map(|peer| {
+            peer.parse()
+                .map_err(|error| format!("invalid peer `{peer}` in config: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    config.peers_file = file.peers_file;
+    config.shutdown_file = file.shutdown_file;
+    config.max_peers = file.max_peers.max(1);
+    config.mine = file.mine;
+    config.mine_interval = Duration::from_secs(file.mine_interval_secs);
+    config.mine_attempts = file.mine_attempts;
+
+    if let Some(wallet_path) = file.wallet {
+        apply_wallet_file(config, Some(&wallet_path))?;
+    }
+    if let Some(miner_address) = file.miner_address {
+        config.miner_address = parse_address(Some(&miner_address))?;
+    }
+    if let Some(secret_key) = file.miner_secret_key {
+        config.miner_secret_key = Some(parse_secret_key(Some(&secret_key))?);
+    }
+
+    Ok(())
+}
+
 fn apply_wallet_file(config: &mut RunConfig, path: Option<&String>) -> Result<(), String> {
     let path = path.ok_or_else(|| "missing value for --wallet".to_string())?;
     let wallet = load_wallet(path)?;
@@ -1550,31 +1824,6 @@ fn load_wallet(path: &str) -> Result<Wallet, String> {
     Ok(wallet)
 }
 
-fn load_peers_file(path: &str) -> Result<Vec<SocketAddr>, String> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("failed to read peers file {path}: {error}")),
-    };
-    let mut peers = Vec::new();
-    for (index, line) in contents.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        peers.push(
-            line.parse()
-                .map_err(|error| format!("invalid peer in {path} line {}: {error}", index + 1))?,
-        );
-    }
-    Ok(peers)
-}
-
-fn dedupe_peers(peers: &mut Vec<SocketAddr>) {
-    let mut seen = HashSet::new();
-    peers.retain(|peer| seen.insert(*peer));
-}
-
 fn parse_socket(value: Option<&String>, flag: &str) -> Result<SocketAddr, String> {
     value
         .ok_or_else(|| format!("missing value for {flag}"))?
@@ -1582,109 +1831,7 @@ fn parse_socket(value: Option<&String>, flag: &str) -> Result<SocketAddr, String
         .map_err(|error| format!("invalid socket address for {flag}: {error}"))
 }
 
-fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("failed to set read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("failed to set write timeout: {error}"))?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerPoll {
-    Idle,
-    Synced,
-}
-
-fn poll_peer(peer: SocketAddr, node: &mut Node) -> Result<PeerPoll, String> {
-    handshake_peer(peer, node)?;
-    let tip = request_tip(peer)?;
-    let local_height = node.tip_height().unwrap_or(Height(0)).0;
-    if tip.0 <= local_height {
-        return Ok(PeerPoll::Idle);
-    }
-
-    let target = tip.0.min(local_height.saturating_add(MAX_BLOCKS_PER_SYNC));
-    for height in local_height.saturating_add(1)..=target {
-        request_block(peer, node, Height(height))?;
-    }
-    Ok(PeerPoll::Synced)
-}
-
-fn handshake_peer(peer: SocketAddr, node: &Node) -> Result<(), String> {
-    let version = VersionInfo::local(
-        node.tip_height()
-            .zip(node.tip_hash())
-            .map(|(height, hash)| TipInfo { height, hash }),
-    );
-    match roundtrip(peer, NetworkMessage::Version(version))? {
-        NetworkMessage::VerAck(remote) => remote
-            .validate_compatibility()
-            .map_err(|reason| format!("peer returned incompatible version: {reason:?}")),
-        NetworkMessage::Reject { reason, message } => {
-            Err(format!("peer rejected handshake: {reason:?}: {message}"))
-        }
-        _ => Err("peer returned unexpected handshake response".to_string()),
-    }
-}
-
-fn request_tip(peer: SocketAddr) -> Result<Height, String> {
-    match roundtrip(peer, NetworkMessage::GetTip)? {
-        NetworkMessage::Tip(tip) => Ok(tip.height),
-        _ => Err("peer returned unexpected tip response".to_string()),
-    }
-}
-
-fn request_peers(peer: SocketAddr) -> Result<Vec<PeerInfo>, String> {
-    match roundtrip(peer, NetworkMessage::GetPeers)? {
-        NetworkMessage::Peers(peers) => Ok(peers),
-        _ => Err("peer returned unexpected peers response".to_string()),
-    }
-}
-
-fn request_block(peer: SocketAddr, node: &mut Node, height: Height) -> Result<(), String> {
-    let response = roundtrip(peer, NetworkMessage::GetBlockByHeight { height })?;
-    let NetworkMessage::Block(block) = response else {
-        return Err(format!("peer did not return block at height {}", height.0));
-    };
-    node.apply_block(block)
-        .map_err(|error| format!("failed to apply block {} from {peer}: {error}", height.0))?;
-    node.flush_to_storage()
-        .map_err(|error| format!("failed to flush synced block: {error}"))?;
-    println!(
-        "synced height={} tip={}",
-        node.tip_height().unwrap_or(Height(0)).0,
-        format_hash(node.tip_hash())
-    );
-    Ok(())
-}
-
-fn roundtrip(peer: SocketAddr, message: NetworkMessage) -> Result<NetworkMessage, String> {
-    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
-        .map_err(|error| format!("connect failed: {error}"))?;
-    configure_stream(&stream, Duration::from_secs(5))?;
-    write_message(&mut stream, &message.to_envelope())
-        .map_err(|error| format!("send failed: {error}"))?;
-    read_message(&mut stream)
-        .map(|envelope| envelope.message)
-        .map_err(|error| format!("read failed: {error}"))
-}
-
-fn send_message(peer: SocketAddr, message: NetworkMessage) -> Result<(), String> {
-    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
-        .map_err(|error| format!("connect failed: {error}"))?;
-    configure_stream(&stream, Duration::from_secs(5))?;
-    write_message(&mut stream, &message.to_envelope())
-        .map_err(|error| format!("send failed: {error}"))
-}
-
 fn mine_once(node: &mut Node, _config: &RunConfig) -> Result<Option<Block>, String> {
-    // Mining requires at least one transaction in the mempool
-    // Transactions can be submitted via RPC or received from peers
-    // For bootstrapping, see: paqus --help
-
     let timestamp = unix_timestamp()?;
     match node.mine_block(
         _config.miner_address,
@@ -1696,7 +1843,7 @@ fn mine_once(node: &mut Node, _config: &RunConfig) -> Result<Option<Block>, Stri
             node.flush_to_storage()
                 .map_err(|error| format!("failed to flush mined block: {error}"))?;
             println!(
-                "mined height={} hash={} difficulty={} txs={} attempts={}",
+                "mined:: |height::{}|hash::{}|difficulty::{}|txs::{}|attempts::{}|",
                 result.block.height().0,
                 short_hash(Some(result.block.hash())),
                 result.block.difficulty(),
@@ -1739,35 +1886,6 @@ fn parse_nonce(value: Option<&String>) -> Result<Nonce, String> {
         .map_err(|error| format!("invalid nonce: {error}"))
 }
 
-fn resolve_wallet_nonce(address: &Address, rpc_addr: &str) -> Result<Nonce, String> {
-    let address_hex = address_to_string(address);
-    let balance_body = http_get(rpc_addr, &format!("/balance/{address_hex}"))?;
-    let balance: BalanceRpcResponse = serde_json::from_str(&balance_body)
-        .map_err(|error| format!("failed to parse balance rpc response: {error}"))?;
-    let mut next_nonce = balance.nonce.unwrap_or(0);
-
-    let mempool_body = http_get(rpc_addr, "/mempool")?;
-    let mempool: MempoolRpcResponse = serde_json::from_str(&mempool_body)
-        .map_err(|error| format!("failed to parse mempool rpc response: {error}"))?;
-    let mut pending_nonces = mempool
-        .transactions
-        .into_iter()
-        .filter_map(|transaction| (transaction.from == address_hex).then_some(transaction.nonce))
-        .collect::<Vec<_>>();
-    pending_nonces.sort_unstable();
-    pending_nonces.dedup();
-
-    for nonce in pending_nonces {
-        if nonce == next_nonce {
-            next_nonce = next_nonce.saturating_add(1);
-        } else if nonce > next_nonce {
-            break;
-        }
-    }
-
-    Ok(Nonce(next_nonce))
-}
-
 fn signed_transaction_to_hex(transaction: &SignedTransaction) -> Result<String, String> {
     borsh::to_vec(transaction)
         .map(hex::encode)
@@ -1778,52 +1896,6 @@ fn signed_transaction_from_hex(value: &str) -> Result<SignedTransaction, String>
     let bytes = hex::decode(value).map_err(|_| "invalid transaction hex".to_string())?;
     SignedTransaction::try_from_slice(&bytes)
         .map_err(|error| format!("invalid signed transaction bytes: {error}"))
-}
-
-fn http_post_json(addr: &str, path: &str, body: &str) -> Result<String, String> {
-    let addr = addr
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("invalid rpc address: {error}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
-        .map_err(|error| format!("failed to connect rpc: {error}"))?;
-    configure_stream(&stream, Duration::from_secs(5))?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("failed to write rpc request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read rpc response: {error}"))?;
-    Ok(response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or(response))
-}
-
-fn http_get(addr: &str, path: &str) -> Result<String, String> {
-    let addr = addr
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("invalid rpc address: {error}"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
-        .map_err(|error| format!("failed to connect rpc: {error}"))?;
-    configure_stream(&stream, Duration::from_secs(5))?;
-    let request = format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("failed to write rpc request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read rpc response: {error}"))?;
-    Ok(response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or(response))
 }
 
 fn parse_address(value: Option<&String>) -> Result<Address, String> {
@@ -1841,12 +1913,12 @@ fn parse_address_hex(value: &str) -> Result<Address, String> {
     Ok(Address(bytes))
 }
 
-fn parse_hash_hex(value: &str) -> Result<paqus::types::Hash, String> {
+fn parse_hash_hex(value: &str) -> Result<Hash, String> {
     let bytes = hex::decode(value).map_err(|_| "invalid hash hex".to_string())?;
     let bytes = bytes
         .try_into()
         .map_err(|_| "hash has invalid length".to_string())?;
-    Ok(paqus::types::Hash(bytes))
+    Ok(Hash(bytes))
 }
 
 fn unix_timestamp() -> Result<u64, String> {
@@ -1856,12 +1928,18 @@ fn unix_timestamp() -> Result<u64, String> {
         .map_err(|_| "system clock is before unix epoch".to_string())
 }
 
-fn format_hash(hash: Option<paqus::types::Hash>) -> String {
-    hash.map(|hash| hex::encode(hash.0))
+fn format_hash<T>(hash: Option<T>) -> String
+where
+    T: Into<Hash>,
+{
+    hash.map(|hash| hex::encode(hash.into().0))
         .unwrap_or_else(|| "none".to_string())
 }
 
-fn short_hash(hash: Option<paqus::types::Hash>) -> String {
+fn short_hash<T>(hash: Option<T>) -> String
+where
+    T: Into<Hash>,
+{
     let hash = format_hash(hash);
     if hash.len() <= 16 {
         return hash;
@@ -1881,11 +1959,15 @@ fn print_help() {
 paqus
 
 Usage:
+  paqus
+  paqus menu
   paqus --help
   paqus version
   paqus node info
+  paqus node libp2p-info
+  paqus node config [config-path]
   paqus node init [db-path] [miner-address-hex]
-  paqus node run [db-path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address-hex> [db-path]
@@ -1895,14 +1977,23 @@ Usage:
 RPC:
   GET  /status
   GET  /health
+  GET  /chain
   GET  /peers
   GET  /balance/<address-hex>
+  GET  /blocks/latest
+  GET  /blocks/<height>
+  GET  /blocks/hash/<block-hash>
+  GET  /tx/<tx-hash>
+  GET  /address/<address-hex>
+  GET  /accounts
+  GET  /mempool
   POST /tx              JSON: {{\"tx\":\"signed-transaction-hex\"}}
 
-Note: Mining requires at least one transaction in the mempool. Transactions can be submitted via RPC or received from peer nodes. To bootstrap mining with your own account:
+To bootstrap mining with your own account:
   1. Create a wallet: paqus wallet new wallet.json
-  2. Initialize node: paqus node init [db] [miner-addr]
-  3. Run with mining enabled: paqus node run [db] --wallet wallet.json --mine
+  2. Create config: paqus node config
+  3. Edit ./data/paqus/node.json once
+  4. Run: paqus node run
 "
     );
 }
@@ -1925,4 +2016,13 @@ fn print_network_info() {
     println!("block_time_secs: {BLOCK_TIME}");
     println!("finality_depth: {FINALITY_DEPTH}");
     println!("difficulty_start: {DIFFICULTY_START}");
+}
+
+fn print_libp2p_info() -> Result<(), String> {
+    let swarm = libp2p_node::build_swarm()?;
+    println!("peer_id: {}", swarm.local_peer_id());
+    println!("block_topic: {}", libp2p_node::PAQUS_BLOCK_TOPIC);
+    println!("tx_topic: {}", libp2p_node::PAQUS_TX_TOPIC);
+    println!("request_protocol: {}", libp2p_node::PAQUS_REQUEST_PROTOCOL);
+    Ok(())
 }
