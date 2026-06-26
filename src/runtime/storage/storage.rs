@@ -1,6 +1,7 @@
 use crate::runtime::params::{ADDRESS_SIZE, HASH_SIZE, STORAGE_VERSION};
 use crate::runtime::storage::error::StorageError;
 use borsh::{BorshDeserialize, BorshSerialize};
+use lmdb::{Cursor, Database, DatabaseFlags, Environment, Transaction, WriteFlags};
 use paqus::block::Block;
 use paqus::ledger::{Ledger, calculate_state_root};
 use paqus::state::Account;
@@ -8,6 +9,8 @@ use paqus::transaction::SignedTransaction;
 use paqus::types::{Address, BlockHash, BlockHeight, Hash, Height, TransactionHash};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::{fs, time};
 
 const BLOCKS_BY_HEIGHT: &str = "blocks_by_height";
 const BLOCKS_BY_HASH: &str = "blocks_by_hash";
@@ -60,36 +63,66 @@ impl StateSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct Storage {
-    db: sled::Db,
+    env: Arc<Environment>,
+    blocks_by_height: Database,
+    blocks_by_hash: Database,
+    accounts: Database,
+    genesis_accounts: Database,
+    state_snapshots: Database,
+    tx_index: Database,
+    address_tx_index: Database,
+    meta: Database,
 }
 
 impl Storage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let storage = Self {
-            db: sled::open(path)?,
-        };
+        fs::create_dir_all(path.as_ref()).map_err(StorageError::from_std_io)?;
+        let env = Arc::new(
+            Environment::new()
+                .set_max_dbs(16)
+                .set_map_size(1024 * 1024 * 1024)
+                .open(path.as_ref())?,
+        );
+        let storage = Self::from_env(env)?;
         storage.ensure_storage_version()?;
         Ok(storage)
     }
 
     pub fn temporary() -> Result<Self, StorageError> {
-        let storage = Self {
-            db: sled::Config::new().temporary(true).open()?,
-        };
-        storage.ensure_storage_version()?;
-        Ok(storage)
+        let nanos = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "paqus-fullnode-lmdb-{}-{nanos}",
+            std::process::id()
+        ));
+        Self::open(path)
+    }
+
+    fn from_env(env: Arc<Environment>) -> Result<Self, StorageError> {
+        Ok(Self {
+            blocks_by_height: env.create_db(Some(BLOCKS_BY_HEIGHT), DatabaseFlags::empty())?,
+            blocks_by_hash: env.create_db(Some(BLOCKS_BY_HASH), DatabaseFlags::empty())?,
+            accounts: env.create_db(Some(ACCOUNTS), DatabaseFlags::empty())?,
+            genesis_accounts: env.create_db(Some(GENESIS_ACCOUNTS), DatabaseFlags::empty())?,
+            state_snapshots: env.create_db(Some(STATE_SNAPSHOTS), DatabaseFlags::empty())?,
+            tx_index: env.create_db(Some(TX_INDEX), DatabaseFlags::empty())?,
+            address_tx_index: env.create_db(Some(ADDRESS_TX_INDEX), DatabaseFlags::empty())?,
+            meta: env.create_db(Some(META), DatabaseFlags::empty())?,
+            env,
+        })
     }
 
     pub fn load_storage_version(&self) -> Result<Option<u8>, StorageError> {
-        self.meta()?
-            .get(STORAGE_VERSION_KEY)?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        let txn = self.env.begin_ro_txn()?;
+        read_value(&txn, self.meta, STORAGE_VERSION_KEY)
     }
 
     fn save_storage_version(&self, version: u8) -> Result<(), StorageError> {
-        self.meta()?
-            .insert(STORAGE_VERSION_KEY, encode(&version)?.as_slice())?;
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, self.meta, STORAGE_VERSION_KEY, &version)?;
+        txn.commit()?;
         Ok(())
     }
 
@@ -109,28 +142,41 @@ impl Storage {
     }
 
     fn is_empty_database(&self) -> Result<bool, StorageError> {
-        Ok(self.blocks_by_height()?.is_empty()
-            && self.blocks_by_hash()?.is_empty()
-            && self.accounts()?.is_empty()
-            && self.genesis_accounts()?.is_empty()
-            && self.state_snapshots()?.is_empty()
-            && self.tx_index()?.is_empty()
-            && self.address_tx_index()?.is_empty())
+        let txn = self.env.begin_ro_txn()?;
+        Ok(is_db_empty(&txn, self.blocks_by_height)?
+            && is_db_empty(&txn, self.blocks_by_hash)?
+            && is_db_empty(&txn, self.accounts)?
+            && is_db_empty(&txn, self.genesis_accounts)?
+            && is_db_empty(&txn, self.state_snapshots)?
+            && is_db_empty(&txn, self.tx_index)?
+            && is_db_empty(&txn, self.address_tx_index)?)
     }
 
     pub fn save_block(&self, block: &Block) -> Result<(), StorageError> {
         let bytes = encode(block)?;
-        self.blocks_by_height()?
-            .insert(height_key(block.height()), bytes.as_slice())?;
-        self.blocks_by_hash()?
-            .insert(block.hash().0.as_slice(), bytes.as_slice())?;
-        self.index_block_transactions(block)?;
+        let mut txn = self.env.begin_rw_txn()?;
+        txn.put(
+            self.blocks_by_height,
+            &height_key(block.height()),
+            &bytes,
+            WriteFlags::empty(),
+        )?;
+        txn.put(
+            self.blocks_by_hash,
+            &block.hash().0,
+            &bytes,
+            WriteFlags::empty(),
+        )?;
+        self.index_block_transactions(&mut txn, block)?;
+        txn.commit()?;
         Ok(())
     }
 
-    fn index_block_transactions(&self, block: &Block) -> Result<(), StorageError> {
-        let tx_index = self.tx_index()?;
-        let address_tx_index = self.address_tx_index()?;
+    fn index_block_transactions(
+        &self,
+        txn: &mut lmdb::RwTransaction<'_>,
+        block: &Block,
+    ) -> Result<(), StorageError> {
         let block_hash = block.hash();
 
         for (index, transaction) in block.transactions.iter().enumerate() {
@@ -142,7 +188,7 @@ impl Storage {
                 block_hash,
                 tx_index: tx_index_u32,
             };
-            tx_index.insert(tx_hash.0.as_slice(), encode(&location)?.as_slice())?;
+            put_value(txn, self.tx_index, &tx_hash.0, &location)?;
 
             let sent_location = AddressTransactionLocation {
                 tx_hash,
@@ -151,14 +197,16 @@ impl Storage {
                 tx_index: tx_index_u32,
                 sent: true,
             };
-            address_tx_index.insert(
-                address_tx_key(
+            put_value(
+                txn,
+                self.address_tx_index,
+                &address_tx_key(
                     &transaction.payload.from,
                     block.height(),
                     tx_index_u32,
                     true,
                 ),
-                encode(&sent_location)?.as_slice(),
+                &sent_location,
             )?;
 
             if transaction.payload.to != transaction.payload.from {
@@ -166,9 +214,11 @@ impl Storage {
                     sent: false,
                     ..sent_location
                 };
-                address_tx_index.insert(
-                    address_tx_key(&transaction.payload.to, block.height(), tx_index_u32, false),
-                    encode(&received_location)?.as_slice(),
+                put_value(
+                    txn,
+                    self.address_tx_index,
+                    &address_tx_key(&transaction.payload.to, block.height(), tx_index_u32, false),
+                    &received_location,
                 )?;
             }
         }
@@ -177,8 +227,8 @@ impl Storage {
     }
 
     pub fn load_block_by_height(&self, height: BlockHeight) -> Result<Option<Block>, StorageError> {
-        self.blocks_by_height()?
-            .get(height_key(height))?
+        let txn = self.env.begin_ro_txn()?;
+        read_bytes(&txn, self.blocks_by_height, &height_key(height))?
             .map(|bytes| {
                 let block: Block = decode(&bytes)?;
                 if block.height() != height {
@@ -192,8 +242,8 @@ impl Storage {
     }
 
     pub fn load_block_by_hash(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
-        self.blocks_by_hash()?
-            .get(hash.0.as_slice())?
+        let txn = self.env.begin_ro_txn()?;
+        read_bytes(&txn, self.blocks_by_hash, &hash.0)?
             .map(|bytes| {
                 let block: Block = decode(&bytes)?;
                 if block.hash() != *hash {
@@ -210,10 +260,8 @@ impl Storage {
         &self,
         hash: &TransactionHash,
     ) -> Result<Option<TransactionLocation>, StorageError> {
-        self.tx_index()?
-            .get(hash.0.as_slice())?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        let txn = self.env.begin_ro_txn()?;
+        read_value(&txn, self.tx_index, &hash.0)
     }
 
     pub fn load_transaction(
@@ -254,9 +302,12 @@ impl Storage {
     ) -> Result<Vec<AddressTransactionLocation>, StorageError> {
         let prefix = address.0;
         let mut locations = Vec::new();
-        for entry in self.address_tx_index()?.scan_prefix(prefix) {
-            let (_key, bytes) = entry?;
-            locations.push(decode(&bytes)?);
+        let txn = self.env.begin_ro_txn()?;
+        let mut cursor = txn.open_ro_cursor(self.address_tx_index)?;
+        for (key, bytes) in cursor.iter() {
+            if key.starts_with(&prefix) {
+                locations.push(decode(bytes)?);
+            }
         }
         locations.sort_by_key(|location: &AddressTransactionLocation| {
             (location.block_height, location.tx_index, location.sent)
@@ -265,34 +316,32 @@ impl Storage {
     }
 
     pub fn save_account(&self, account: &Account) -> Result<(), StorageError> {
-        self.accounts()?
-            .insert(account.address.0.as_slice(), encode(account)?.as_slice())?;
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, self.accounts, &account.address.0, account)?;
+        txn.commit()?;
         Ok(())
     }
 
     pub fn load_account(&self, address: &Address) -> Result<Option<Account>, StorageError> {
-        self.accounts()?
-            .get(address.0.as_slice())?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        let txn = self.env.begin_ro_txn()?;
+        read_value(&txn, self.accounts, &address.0)
     }
 
     pub fn save_genesis_accounts(
         &self,
         accounts: &BTreeMap<Address, Account>,
     ) -> Result<(), StorageError> {
-        self.genesis_accounts()?
-            .insert(b"accounts", encode(accounts)?.as_slice())?;
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, self.genesis_accounts, b"accounts", accounts)?;
+        txn.commit()?;
         Ok(())
     }
 
     pub fn load_genesis_accounts(
         &self,
     ) -> Result<Option<BTreeMap<Address, Account>>, StorageError> {
-        self.genesis_accounts()?
-            .get(b"accounts")?
-            .map(|bytes| decode(&bytes))
-            .transpose()
+        let txn = self.env.begin_ro_txn()?;
+        read_value(&txn, self.genesis_accounts, b"accounts")
     }
 
     pub fn save_state_snapshot(&self, ledger: &Ledger) -> Result<(), StorageError> {
@@ -305,8 +354,14 @@ impl Storage {
             state_root: ledger.state_root().into(),
             accounts: ledger.accounts.clone(),
         };
-        self.state_snapshots()?
-            .insert(height_key(height), encode(&snapshot)?.as_slice())?;
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(
+            &mut txn,
+            self.state_snapshots,
+            &height_key(height),
+            &snapshot,
+        )?;
+        txn.commit()?;
         Ok(())
     }
 
@@ -314,8 +369,8 @@ impl Storage {
         &self,
         height: BlockHeight,
     ) -> Result<Option<StateSnapshot>, StorageError> {
-        self.state_snapshots()?
-            .get(height_key(height))?
+        let txn = self.env.begin_ro_txn()?;
+        read_bytes(&txn, self.state_snapshots, &height_key(height))?
             .map(|bytes| {
                 let snapshot: StateSnapshot = decode(&bytes)?;
                 if snapshot.height != height {
@@ -334,25 +389,26 @@ impl Storage {
     }
 
     pub fn save_tip(&self, height: BlockHeight, hash: &BlockHash) -> Result<(), StorageError> {
-        let meta = self.meta()?;
-        meta.insert(TIP_HEIGHT_KEY, encode(&height)?.as_slice())?;
-        meta.insert(TIP_HASH_KEY, hash.0.as_slice())?;
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, self.meta, TIP_HEIGHT_KEY, &height)?;
+        txn.put(self.meta, &TIP_HASH_KEY, &hash.0, WriteFlags::empty())?;
+        txn.commit()?;
         Ok(())
     }
 
     pub fn load_tip(&self) -> Result<Option<(BlockHeight, BlockHash)>, StorageError> {
-        let meta = self.meta()?;
-        let Some(height_bytes) = meta.get(TIP_HEIGHT_KEY)? else {
+        let txn = self.env.begin_ro_txn()?;
+        let Some(height_bytes) = read_bytes(&txn, self.meta, TIP_HEIGHT_KEY)? else {
             return Ok(None);
         };
-        let Some(hash_bytes) = meta.get(TIP_HASH_KEY)? else {
+        let Some(hash_bytes) = read_bytes(&txn, self.meta, TIP_HASH_KEY)? else {
             return Ok(None);
         };
 
         let height = decode(&height_bytes)?;
         let hash = Hash(
             hash_bytes
-                .as_ref()
+                .as_slice()
                 .try_into()
                 .map_err(|_| invalid_data("stored tip hash has invalid length"))?,
         );
@@ -385,15 +441,18 @@ impl Storage {
         self.validate_chain_integrity()?;
 
         let mut ledger = Ledger::new();
-        for account in self.accounts()?.iter() {
-            let (_key, bytes) = account?;
-            let account: Account = decode(&bytes)?;
-            if account.address.0.as_slice() != _key.as_ref() {
-                return Err(StorageError::Integrity(
-                    "stored account address does not match account key",
-                ));
+        {
+            let txn = self.env.begin_ro_txn()?;
+            let mut cursor = txn.open_ro_cursor(self.accounts)?;
+            for (_key, bytes) in cursor.iter() {
+                let account: Account = decode(bytes)?;
+                if account.address.0.as_slice() != _key {
+                    return Err(StorageError::Integrity(
+                        "stored account address does not match account key",
+                    ));
+                }
+                ledger.accounts.insert(account.address, account);
             }
-            ledger.accounts.insert(account.address, account);
         }
 
         if let Some((tip_height, _tip_hash)) = self.load_tip()? {
@@ -489,60 +548,68 @@ impl Storage {
     }
 
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush()?;
+        self.env.sync(true)?;
         Ok(())
     }
 
-    fn blocks_by_height(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(BLOCKS_BY_HEIGHT)?)
-    }
-
-    fn blocks_by_hash(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(BLOCKS_BY_HASH)?)
+    #[cfg(test)]
+    pub(crate) fn test_put_blocks_by_height<T: BorshSerialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), StorageError> {
+        self.test_put(self.blocks_by_height, key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_blocks_by_height(&self) -> Result<sled::Tree, StorageError> {
-        self.blocks_by_height()
+    pub(crate) fn test_put_blocks_by_hash<T: BorshSerialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), StorageError> {
+        self.test_put(self.blocks_by_hash, key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_blocks_by_hash(&self) -> Result<sled::Tree, StorageError> {
-        self.blocks_by_hash()
-    }
-
-    fn accounts(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(ACCOUNTS)?)
-    }
-
-    fn genesis_accounts(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(GENESIS_ACCOUNTS)?)
-    }
-
-    fn state_snapshots(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(STATE_SNAPSHOTS)?)
+    pub(crate) fn test_put_state_snapshot<T: BorshSerialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), StorageError> {
+        self.test_put(self.state_snapshots, key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_state_snapshots(&self) -> Result<sled::Tree, StorageError> {
-        self.state_snapshots()
-    }
-
-    fn meta(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(META)?)
-    }
-
-    fn tx_index(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(TX_INDEX)?)
-    }
-
-    fn address_tx_index(&self) -> Result<sled::Tree, StorageError> {
-        Ok(self.db.open_tree(ADDRESS_TX_INDEX)?)
+    pub(crate) fn test_put_meta<T: BorshSerialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), StorageError> {
+        self.test_put(self.meta, key, value)
     }
 
     #[cfg(test)]
-    pub(crate) fn test_meta(&self) -> Result<sled::Tree, StorageError> {
-        self.meta()
+    pub(crate) fn test_remove_meta(&self, key: &[u8]) -> Result<(), StorageError> {
+        let mut txn = self.env.begin_rw_txn()?;
+        match txn.del(self.meta, &key, None) {
+            Ok(()) | Err(lmdb::Error::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_put<T: BorshSerialize>(
+        &self,
+        db: Database,
+        key: &[u8],
+        value: &T,
+    ) -> Result<(), StorageError> {
+        let mut txn = self.env.begin_rw_txn()?;
+        put_value(&mut txn, db, key, value)?;
+        txn.commit()?;
+        Ok(())
     }
 }
 
@@ -557,6 +624,44 @@ fn address_tx_key(address: &Address, height: BlockHeight, tx_index: u32, sent: b
     key.extend_from_slice(&tx_index.to_be_bytes());
     key.push(u8::from(sent));
     key
+}
+
+fn read_bytes(
+    txn: &lmdb::RoTransaction<'_>,
+    db: Database,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, StorageError> {
+    match txn.get(db, &key) {
+        Ok(bytes) => Ok(Some(bytes.to_vec())),
+        Err(lmdb::Error::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_value<T: BorshDeserialize>(
+    txn: &lmdb::RoTransaction<'_>,
+    db: Database,
+    key: &[u8],
+) -> Result<Option<T>, StorageError> {
+    read_bytes(txn, db, key)?
+        .map(|bytes| decode(&bytes))
+        .transpose()
+}
+
+fn put_value<T: BorshSerialize>(
+    txn: &mut lmdb::RwTransaction<'_>,
+    db: Database,
+    key: &[u8],
+    value: &T,
+) -> Result<(), StorageError> {
+    let bytes = encode(value)?;
+    txn.put(db, &key, &bytes, WriteFlags::empty())?;
+    Ok(())
+}
+
+fn is_db_empty(txn: &lmdb::RoTransaction<'_>, db: Database) -> Result<bool, StorageError> {
+    let mut cursor = txn.open_ro_cursor(db)?;
+    Ok(cursor.iter().next().is_none())
 }
 
 fn encode<T: BorshSerialize>(value: &T) -> Result<Vec<u8>, StorageError> {

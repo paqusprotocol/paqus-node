@@ -101,10 +101,45 @@ Run node with custom P2P and RPC addresses:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen [::]:30333 \
+  --listen '[::]:30333' \
   --rpc-listen 127.0.0.1:9933 \
   --wallet wallet.json \
   --mine
+```
+
+Run a public bootstrap/mining node with gateway registration:
+
+```bash
+cargo run -- node run ./data/paqus \
+  --listen '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:30333' \
+  --rpc-listen 127.0.0.1:9933 \
+  --gateway '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:8080' \
+  --public-addr '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:30333' \
+  --wallet wallet.json \
+  --mine
+```
+
+Run another node and discover peers from the gateway:
+
+```bash
+cargo run -- node run ./data/paqus \
+  --listen '[::]:30333' \
+  --rpc-listen 127.0.0.1:9933 \
+  --gateway '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:8080' \
+  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
+  --wallet wallet.json
+```
+
+Run another node with a manual bootstrap peer and gateway:
+
+```bash
+cargo run -- node run ./data/paqus \
+  --listen '[::]:30333' \
+  --rpc-listen 127.0.0.1:9933 \
+  --gateway '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:8080' \
+  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
+  --peer '[2404:8000:1044:4d8:822b:f9ff:fee2:365]:30333' \
+  --wallet wallet.json
 ```
 
 Or save those values once in `./data/paqus/node.json`:
@@ -131,7 +166,7 @@ Connect to a peer:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --peer [::]:30333 \
+  --peer '[::1]:30333' \
   --wallet wallet.json
 ```
 
@@ -147,6 +182,24 @@ Stop the default node:
 
 ```bash
 touch ./data/paqus/STOP
+```
+
+## Storage
+
+The node uses LMDB for local chain storage. The database path stays as a directory:
+
+```text
+./data/paqus/
+  data.mdb
+  lock.mdb
+```
+
+`data.mdb` contains blocks, accounts, state snapshots, transaction indexes, and metadata. `lock.mdb` is the LMDB lock file. These files are binary and should not be edited manually.
+
+If you are upgrading from an old sled-backed node database, start fresh by removing the old data directory:
+
+```bash
+rm -rf ./data/paqus
 ```
 
 ## Transactions

@@ -1,10 +1,12 @@
 use borsh::io;
 use std::error::Error;
 use std::fmt;
+use std::io as std_io;
 
 #[derive(Debug)]
 pub enum StorageError {
-    Database(sled::Error),
+    Database(lmdb::Error),
+    Io(std_io::Error),
     Serialization(io::Error),
     Integrity(&'static str),
     MissingStorageVersion,
@@ -15,6 +17,7 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StorageError::Database(error) => write!(f, "storage database error: {error}"),
+            StorageError::Io(error) => write!(f, "storage io error: {error}"),
             StorageError::Serialization(error) => write!(f, "storage serialization error: {error}"),
             StorageError::Integrity(message) => write!(f, "storage integrity error: {message}"),
             StorageError::MissingStorageVersion => {
@@ -32,6 +35,7 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             StorageError::Database(error) => Some(error),
+            StorageError::Io(error) => Some(error),
             StorageError::Serialization(error) => Some(error),
             StorageError::Integrity(_) => None,
             StorageError::MissingStorageVersion => None,
@@ -40,8 +44,8 @@ impl Error for StorageError {
     }
 }
 
-impl From<sled::Error> for StorageError {
-    fn from(error: sled::Error) -> Self {
+impl From<lmdb::Error> for StorageError {
+    fn from(error: lmdb::Error) -> Self {
         StorageError::Database(error)
     }
 }
@@ -49,5 +53,11 @@ impl From<sled::Error> for StorageError {
 impl From<io::Error> for StorageError {
     fn from(error: io::Error) -> Self {
         StorageError::Serialization(error)
+    }
+}
+
+impl StorageError {
+    pub fn from_std_io(error: std_io::Error) -> Self {
+        StorageError::Io(error)
     }
 }

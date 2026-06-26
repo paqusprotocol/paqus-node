@@ -3,3 +3,6 @@ pub mod storage;
 
 pub use error::StorageError;
 pub use storage::{StateSnapshot, Storage};
+
+#[cfg(test)]
+mod test;

@@ -1,11 +1,11 @@
 use super::{StateSnapshot, Storage, StorageError};
-use crate::runtime::params::{BASE_FEE, STORAGE_VERSION};
+use crate::runtime::params::{MIN_FEE, STORAGE_VERSION};
 use paqus::block::Block;
 use paqus::crypto::{address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
 use paqus::state::Account;
 use paqus::transaction::{SignedTransaction, Transaction};
-use paqus::types::{Address, Amount, Hash, Height, Nonce};
+use paqus::types::{Address, Amount, BlockHash, Hash, Height, Nonce};
 
 fn address(byte: u8) -> Address {
     Address([byte; 20])
@@ -25,7 +25,7 @@ fn block(height: u64, previous_hash: Hash) -> Block {
 fn signed_transaction(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new(from, to, Amount(amount), Amount(BASE_FEE), Nonce(nonce));
+    let payload = Transaction::new(from, to, Amount(amount), Amount(MIN_FEE), Nonce(nonce));
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
     SignedTransaction::new(payload, keypair.public_key, signature)
 }
@@ -98,14 +98,7 @@ fn initializes_storage_version_for_empty_database() {
 fn rejects_unsupported_storage_version() {
     let storage = Storage::temporary().unwrap();
     storage
-        .test_meta()
-        .unwrap()
-        .insert(
-            b"storage_version",
-            borsh::to_vec(&STORAGE_VERSION.saturating_add(1))
-                .unwrap()
-                .as_slice(),
-        )
+        .test_put_meta(b"storage_version", &STORAGE_VERSION.saturating_add(1))
         .unwrap();
 
     assert!(matches!(
@@ -120,11 +113,7 @@ fn rejects_unsupported_storage_version() {
 #[test]
 fn rejects_existing_database_without_storage_version() {
     let storage = Storage::temporary().unwrap();
-    storage
-        .test_meta()
-        .unwrap()
-        .remove(b"storage_version")
-        .unwrap();
+    storage.test_remove_meta(b"storage_version").unwrap();
     storage.save_block(&block(0, Hash([0; 64]))).unwrap();
 
     assert!(matches!(
@@ -137,12 +126,9 @@ fn rejects_existing_database_without_storage_version() {
 fn rejects_block_loaded_from_wrong_height_key() {
     let storage = Storage::temporary().unwrap();
     let block = block(1, Hash([0; 64]));
-    let bytes = borsh::to_vec(&block).unwrap();
 
     storage
-        .test_blocks_by_height()
-        .unwrap()
-        .insert(Height(0).0.to_be_bytes(), bytes)
+        .test_put_blocks_by_height(&Height(0).0.to_be_bytes(), &block)
         .unwrap();
 
     assert!(matches!(
@@ -157,13 +143,10 @@ fn rejects_block_loaded_from_wrong_height_key() {
 fn rejects_block_loaded_from_wrong_hash_key() {
     let storage = Storage::temporary().unwrap();
     let block = block(0, Hash([0; 64]));
-    let bytes = borsh::to_vec(&block).unwrap();
-    let wrong_hash = Hash([7; 64]);
+    let wrong_hash = BlockHash([7; 64]);
 
     storage
-        .test_blocks_by_hash()
-        .unwrap()
-        .insert(wrong_hash.0.as_slice(), bytes)
+        .test_put_blocks_by_hash(wrong_hash.0.as_slice(), &block)
         .unwrap();
 
     assert!(matches!(
@@ -188,7 +171,7 @@ fn stores_and_loads_accounts() {
 #[test]
 fn stores_and_loads_chain_tip() {
     let storage = Storage::temporary().unwrap();
-    let hash = Hash([7; 64]);
+    let hash = BlockHash([7; 64]);
 
     assert_eq!(storage.load_tip().unwrap(), None);
 
@@ -201,7 +184,7 @@ fn stores_and_loads_chain_tip() {
 fn validates_stored_chain_integrity() {
     let storage = Storage::temporary().unwrap();
     let genesis = block(0, Hash([0; 64]));
-    let next = block(1, genesis.hash());
+    let next = block(1, genesis.hash().into());
 
     storage.save_block(&genesis).unwrap();
     storage.save_block(&next).unwrap();
@@ -214,7 +197,7 @@ fn validates_stored_chain_integrity() {
 fn rejects_chain_integrity_when_tip_block_is_missing() {
     let storage = Storage::temporary().unwrap();
 
-    storage.save_tip(Height(3), &Hash([7; 64])).unwrap();
+    storage.save_tip(Height(3), &BlockHash([7; 64])).unwrap();
 
     assert!(matches!(
         storage.validate_chain_integrity(),
@@ -330,7 +313,7 @@ fn stores_and_loads_state_snapshot() {
 fn difficulty_window_uses_previous_block_for_single_block_interval() {
     let storage = Storage::temporary().unwrap();
     let genesis = block(0, Hash([0; 64]));
-    let next = block(1, genesis.hash());
+    let next = block(1, genesis.hash().into());
 
     storage.save_block(&genesis).unwrap();
     storage.save_block(&next).unwrap();
@@ -349,7 +332,7 @@ fn difficulty_window_uses_configured_block_interval() {
 
     for height in 0..=10 {
         let block = block(height, previous_hash);
-        previous_hash = block.hash();
+        previous_hash = block.hash().into();
         storage.save_block(&block).unwrap();
     }
 
@@ -372,15 +355,13 @@ fn rejects_tampered_state_snapshot_root() {
     accounts.insert(address(1), Account::new(address(1), Amount(100)));
     let snapshot = StateSnapshot {
         height: Height(0),
-        block_hash: Hash([1; 64]),
+        block_hash: BlockHash([1; 64]),
         state_root: Hash([9; 64]),
         accounts,
     };
 
     storage
-        .test_state_snapshots()
-        .unwrap()
-        .insert(Height(0).0.to_be_bytes(), borsh::to_vec(&snapshot).unwrap())
+        .test_put_state_snapshot(&Height(0).0.to_be_bytes(), &snapshot)
         .unwrap();
 
     assert!(matches!(
