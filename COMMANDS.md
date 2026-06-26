@@ -101,7 +101,7 @@ Run node with custom P2P and RPC addresses:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen [2404:8000:1044:4d8:822b:f9ff:fee2:365]:30333 \
+  --listen [::]:30333 \
   --rpc-listen 127.0.0.1:9933 \
   --wallet wallet.json \
   --mine
@@ -112,7 +112,7 @@ Or save those values once in `./data/paqus/node.json`:
 ```json
 {
   "db_path": "./data/paqus",
-  "listen_addr": "0.0.0.0:30333",
+  "listen_addr": "[::]:30333",
   "rpc_addr": "127.0.0.1:9933",
   "peers": [],
   "peers_file": "./data/paqus/peers.txt",
@@ -131,7 +131,7 @@ Connect to a peer:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --peer <peer-ip:30333> \
+  --peer [::]:30333 \
   --wallet wallet.json
 ```
 
