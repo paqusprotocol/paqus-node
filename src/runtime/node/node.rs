@@ -174,6 +174,10 @@ impl Node {
                 self.cache_orphan_block(block);
                 Ok(())
             }
+            Err(NodeError::ForkChoice(
+                paqus::ledger::fork_choice::ForkChoiceError::DuplicateBlock,
+            )) => Ok(()),
+            Err(NodeError::Ledger(paqus::ledger::LedgerError::DuplicateBlock)) => Ok(()),
             Err(error) => Err(error),
         }
     }
