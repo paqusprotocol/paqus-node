@@ -19,7 +19,9 @@ use gateway::{heartbeat_peer, register_peer, request_gateway_peers};
 use gossip::{BroadcastReport, broadcast_to_peers};
 use mempool::resolve_wallet_nonce;
 use network::{bind_nonblocking, configure_stream, http_get, http_post_json, send_message};
-use p2p::{PeerPoll, PeerState, dedupe_peers, load_peers_file, poll_peer, request_peers};
+use p2p::{
+    PeerPoll, PeerState, dedupe_peers, load_peers_file, poll_peer, request_peers, save_peers_file,
+};
 use paquscore::{
     Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
     NetworkMessage, Node, Nonce, PeerInfo, SecretKey, SignedTransaction, Transaction, Wallet,
@@ -48,6 +50,7 @@ const DEFAULT_NODE_DB: &str = "./data/paqus";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:30333";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:9933";
 const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
+const DEFAULT_PEERS_FILE: &str = "./data/paqus/peers.json";
 const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
 const DEFAULT_MAX_PEERS: usize = 128;
 const DEFAULT_SHUTDOWN_FILE: &str = "./data/paqus/STOP";
@@ -771,7 +774,7 @@ impl Default for RunConfig {
                 .parse()
                 .expect("default rpc address must be valid"),
             peers: Vec::new(),
-            peers_file: None,
+            peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
             public_addr: None,
             gateway_heartbeat: DEFAULT_GATEWAY_HEARTBEAT,
@@ -794,7 +797,7 @@ impl Default for RunConfigFile {
             listen_addr: defaults.listen_addr.to_string(),
             rpc_addr: defaults.rpc_addr.to_string(),
             peers: Vec::new(),
-            peers_file: Some("./data/paqus/peers.txt".to_string()),
+            peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
             public_addr: None,
             gateway_heartbeat_secs: defaults.gateway_heartbeat.as_secs(),
@@ -907,13 +910,7 @@ impl NodeService {
         }
 
         for peer in peers {
-            let result = {
-                let mut node = self
-                    .node
-                    .lock()
-                    .map_err(|_| "node state lock poisoned".to_string())?;
-                poll_peer(peer, &mut node)
-            };
+            let result = poll_peer(peer, &self.node);
             match result {
                 Ok(PeerPoll::Idle) | Ok(PeerPoll::Synced) => {
                     let tip = self
@@ -1132,6 +1129,7 @@ impl NodeService {
                     NetworkMessage::GetPeers => Some(NetworkMessage::Peers(self.peer_infos())),
                     NetworkMessage::Peers(peers) => {
                         self.add_peer_infos(peers);
+                        let _ = self.save_peers();
                         None
                     }
                     message => {
@@ -1172,13 +1170,7 @@ impl NodeService {
         };
 
         for peer in due_peers {
-            let result = match self.node.lock() {
-                Ok(mut node) => poll_peer(peer, &mut node),
-                Err(_) => {
-                    eprintln!("node state lock poisoned");
-                    return;
-                }
-            };
+            let result = poll_peer(peer, &self.node);
             match result {
                 Ok(PeerPoll::Idle) | Ok(PeerPoll::Synced) => {
                     let tip = match self.node.lock() {
@@ -1313,10 +1305,9 @@ impl NodeService {
             .peers
             .lock()
             .map_err(|_| "peer state lock poisoned".to_string())?;
-        let mut peers = peers.keys().map(SocketAddr::to_string).collect::<Vec<_>>();
+        let mut peers = peers.keys().copied().collect::<Vec<_>>();
         peers.sort();
-        fs::write(path, peers.join("\n"))
-            .map_err(|error| format!("failed to write peers file {path}: {error}"))
+        save_peers_file(path, peers)
     }
 
     fn peer_infos(&self) -> Vec<PeerInfo> {
@@ -1324,12 +1315,20 @@ impl NodeService {
             eprintln!("peer state lock poisoned");
             return Vec::new();
         };
-        peers
+        let mut infos = peers
             .keys()
             .map(|addr| PeerInfo {
                 address: addr.to_string(),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(public_addr) = self.config.public_addr {
+            infos.push(PeerInfo {
+                address: public_addr.to_string(),
+            });
+        }
+        infos.sort_by(|left, right| left.address.cmp(&right.address));
+        infos.dedup_by(|left, right| left.address == right.address);
+        infos
     }
 
     fn broadcast(&mut self, message: NetworkMessage) -> BroadcastReport {

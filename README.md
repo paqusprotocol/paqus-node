@@ -108,6 +108,16 @@ Advanced form for printing signed transaction hex without broadcasting:
 cargo run -- wallet send --wallet wallet.json --to <recipient-address-hex> --amount 10
 ```
 
+Broadcast the advanced form to the node RPC with `--submit`:
+
+```bash
+cargo run -- wallet send \
+  --wallet wallet.json \
+  --to <recipient-address-hex> \
+  --amount 10 \
+  --submit
+```
+
 ## Node
 
 Show protocol and network info:
@@ -153,13 +163,25 @@ Common `node run` options:
 
 ## Gateway And Peers
 
+Paqus nodes can discover peers in three ways:
+
+- `--peer <host:port>` manually connects to a known node.
+- `--gateway <host:port>` uses a discovery gateway as an optional bootstrap.
+- `./data/paqus/peers.json` stores peers learned through peer gossip.
+
+For IPv6 socket addresses, wrap the IP in brackets:
+
+```text
+[2001:db8::10]:30333
+```
+
 Run a public node that registers itself with a gateway:
 
 ```bash
 cargo run -- node run ./data/paqus \
   --listen '[::]:30333' \
   --rpc-listen 127.0.0.1:9933 \
-  --gateway '[GATEWAY_HOST]:8080' \
+  --gateway '[GATEWAY_IPV6]:8080' \
   --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
   --wallet wallet.json \
   --mine
@@ -186,9 +208,11 @@ Join through a gateway:
 cargo run -- node run ./data/paqus \
   --listen '[::]:30333' \
   --rpc-listen 127.0.0.1:9933 \
-  --gateway '[GATEWAY_HOST]:8080' \
+  --gateway '[GATEWAY_IPV6]:8080' \
   --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
-  --wallet wallet.json
+  --wallet wallet.json \
+  --mine \
+  --mine-attempts 10000
 ```
 
 Join with a manual peer:
@@ -198,6 +222,34 @@ cargo run -- node run ./data/paqus \
   --peer '[PEER_HOST]:30333' \
   --wallet wallet.json
 ```
+
+Run without a gateway after `peers.json` is populated:
+
+```bash
+cargo run -- node run ./data/paqus \
+  --listen '[::]:30333' \
+  --rpc-listen 127.0.0.1:9933 \
+  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
+  --wallet wallet.json \
+  --mine
+```
+
+Nodes exchange peer lists over the P2P protocol. After a node discovers peers
+from a gateway or manual `--peer`, it caches them in `./data/paqus/peers.json`
+by default:
+
+```json
+{
+  "peers": [
+    "[2001:db8::20]:30333"
+  ]
+}
+```
+
+On the next startup, the node loads this cache, reconnects to known peers, and
+asks them for more peers. Use `--peers-file <path>` to choose another cache
+path. A gateway is only needed for first-time bootstrap or as a fallback when
+the local peer cache is empty or stale.
 
 ## Mining
 

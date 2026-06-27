@@ -1,15 +1,22 @@
 use crate::network::roundtrip;
 use crate::paquscore::{BlockHash, Height, NetworkMessage, Node, PeerInfo, TipInfo, VersionInfo};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_RETRY_BASE: Duration = Duration::from_secs(2);
 const PEER_RETRY_MAX: Duration = Duration::from_secs(60);
 const MAX_BLOCKS_PER_SYNC: u64 = 64;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerCache {
+    peers: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerState {
@@ -58,6 +65,19 @@ pub fn load_peers_file(path: &str) -> Result<Vec<SocketAddr>, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("failed to read peers file {path}: {error}")),
     };
+    if contents.trim_start().starts_with('{') {
+        let cache = serde_json::from_str::<PeerCache>(&contents)
+            .map_err(|error| format!("failed to parse peer cache {path}: {error}"))?;
+        return cache
+            .peers
+            .into_iter()
+            .map(|peer| {
+                peer.parse()
+                    .map_err(|error| format!("invalid peer `{peer}` in {path}: {error}"))
+            })
+            .collect();
+    }
+
     let mut peers = Vec::new();
     for (index, line) in contents.lines().enumerate() {
         let line = line.split('#').next().unwrap_or_default().trim();
@@ -72,15 +92,32 @@ pub fn load_peers_file(path: &str) -> Result<Vec<SocketAddr>, String> {
     Ok(peers)
 }
 
+pub fn save_peers_file(path: &str, peers: Vec<SocketAddr>) -> Result<(), String> {
+    let cache = PeerCache {
+        peers: peers
+            .into_iter()
+            .map(|peer| peer.to_string())
+            .collect::<Vec<_>>(),
+    };
+    let contents = serde_json::to_string_pretty(&cache)
+        .map_err(|error| format!("failed to encode peer cache {path}: {error}"))?;
+    fs::write(path, contents).map_err(|error| format!("failed to write peers file {path}: {error}"))
+}
+
 pub fn dedupe_peers(peers: &mut Vec<SocketAddr>) {
     let mut seen = HashSet::new();
     peers.retain(|peer| seen.insert(*peer));
 }
 
-pub fn poll_peer(peer: SocketAddr, node: &mut Node) -> Result<PeerPoll, String> {
+pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, String> {
     handshake_peer(peer, node)?;
     let tip = request_tip(peer)?;
-    let local_height = node.tip_height().unwrap_or(Height(0)).0;
+    let local_height = node
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?
+        .tip_height()
+        .unwrap_or(Height(0))
+        .0;
     if tip.0 <= local_height {
         return if request_missing_parent_blocks(peer, node)? {
             Ok(PeerPoll::Synced)
@@ -104,12 +141,16 @@ pub fn request_peers(peer: SocketAddr) -> Result<Vec<PeerInfo>, String> {
     }
 }
 
-fn handshake_peer(peer: SocketAddr, node: &Node) -> Result<(), String> {
-    let version = VersionInfo::local(
+fn handshake_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<(), String> {
+    let tip = {
+        let node = node
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
         node.tip_height()
             .zip(node.tip_hash())
-            .map(|(height, hash)| TipInfo { height, hash }),
-    );
+            .map(|(height, hash)| TipInfo { height, hash })
+    };
+    let version = VersionInfo::local(tip);
     match roundtrip(peer, NetworkMessage::Version(version))? {
         NetworkMessage::VerAck(remote) => remote
             .validate_compatibility()
@@ -128,11 +169,14 @@ fn request_tip(peer: SocketAddr) -> Result<Height, String> {
     }
 }
 
-fn request_block(peer: SocketAddr, node: &mut Node, height: Height) -> Result<(), String> {
+fn request_block(peer: SocketAddr, node: &Arc<Mutex<Node>>, height: Height) -> Result<(), String> {
     let response = roundtrip(peer, NetworkMessage::GetBlockByHeight { height })?;
     let NetworkMessage::Block(block) = response else {
         return Err(format!("peer did not return block at height {}", height.0));
     };
+    let mut node = node
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
     node.apply_block(block)
         .map_err(|error| format!("failed to apply block {} from {peer}: {error}", height.0))?;
     node.flush_to_storage()
@@ -148,19 +192,32 @@ fn request_block(peer: SocketAddr, node: &mut Node, height: Height) -> Result<()
     Ok(())
 }
 
-fn request_missing_parent_blocks(peer: SocketAddr, node: &mut Node) -> Result<bool, String> {
+fn request_missing_parent_blocks(
+    peer: SocketAddr,
+    node: &Arc<Mutex<Node>>,
+) -> Result<bool, String> {
     let mut requested = false;
-    for hash in node.drain_missing_parent_requests() {
+    let hashes = node
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?
+        .drain_missing_parent_requests();
+    for hash in hashes {
         requested = true;
         if let Err(error) = request_block_by_hash(peer, node, hash) {
-            node.retry_missing_parent_request(hash);
+            node.lock()
+                .map_err(|_| "node state lock poisoned".to_string())?
+                .retry_missing_parent_request(hash);
             return Err(error);
         }
     }
     Ok(requested)
 }
 
-fn request_block_by_hash(peer: SocketAddr, node: &mut Node, hash: BlockHash) -> Result<(), String> {
+fn request_block_by_hash(
+    peer: SocketAddr,
+    node: &Arc<Mutex<Node>>,
+    hash: BlockHash,
+) -> Result<(), String> {
     let response = roundtrip(peer, NetworkMessage::GetBlockByHash { hash })?;
     let NetworkMessage::Block(block) = response else {
         return Err(format!(
@@ -168,6 +225,9 @@ fn request_block_by_hash(peer: SocketAddr, node: &mut Node, hash: BlockHash) -> 
             hex::encode(hash.0)
         ));
     };
+    let mut node = node
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
     node.apply_block(block)
         .map_err(|error| format!("failed to apply missing parent from {peer}: {error}"))?;
     node.flush_to_storage()
