@@ -1,5 +1,5 @@
 use super::{Mempool, MempoolConfig, MempoolError};
-use crate::runtime::params::{BASE_FEE, MEMPOOL_EXPIRY_SECS};
+use crate::runtime::params::{BASE_FEE, LOW_FEE_EXPIRY_SECS, MEMPOOL_EXPIRY_SECS};
 use paqus::block::Block;
 use paqus::crypto::{address_from_public_key, generate_keypair, sign};
 use paqus::ledger::{Ledger, LedgerError};
@@ -98,8 +98,41 @@ fn uses_default_transaction_limit() {
             max_transactions: crate::runtime::params::MAX_MEMPOOL_TXS,
             max_bytes: crate::runtime::params::MAX_MEMPOOL_BYTES,
             transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+            low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
+            min_relay_fee: crate::runtime::params::DEFAULT_MIN_RELAY_FEE,
+            market_fee: crate::runtime::params::DEFAULT_MARKET_FEE,
         }
     );
+}
+
+#[test]
+fn rejects_transaction_below_configured_min_relay_fee() {
+    let mut mempool = Mempool::with_config(MempoolConfig {
+        min_relay_fee: BASE_FEE + 1,
+        ..MempoolConfig::default()
+    });
+    let transaction = signed_transaction(0);
+
+    assert_eq!(mempool.insert(transaction), Err(MempoolError::FeeTooLow));
+}
+
+#[test]
+fn rejects_zero_fee_even_when_configured_min_relay_fee_is_zero() {
+    let keypair = generate_keypair();
+    let transaction = signed_transaction_from_with_fee(
+        &keypair.secret_key,
+        keypair.public_key,
+        address(2),
+        10,
+        0,
+        0,
+    );
+    let mut mempool = Mempool::with_config(MempoolConfig {
+        min_relay_fee: 0,
+        ..MempoolConfig::default()
+    });
+
+    assert_eq!(mempool.insert(transaction), Err(MempoolError::FeeTooLow));
 }
 
 #[test]
@@ -108,6 +141,7 @@ fn rejects_transaction_when_mempool_is_full() {
         max_transactions: 1,
         max_bytes: crate::runtime::params::MAX_MEMPOOL_BYTES,
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+        ..MempoolConfig::default()
     });
     let first = signed_transaction(0);
     let second = signed_transaction(1);
@@ -127,6 +161,7 @@ fn rejects_transaction_when_mempool_byte_limit_is_full() {
         max_transactions: 10,
         max_bytes: transaction.serialized_size().saturating_sub(1),
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+        ..MempoolConfig::default()
     });
 
     assert_eq!(mempool.insert(transaction), Err(MempoolError::MempoolFull));
@@ -209,11 +244,57 @@ fn prunes_expired_transactions() {
 }
 
 #[test]
+fn prunes_low_fee_transactions_after_low_fee_expiry() {
+    let keypair = generate_keypair();
+    let low_fee = signed_transaction_from_with_fee(
+        &keypair.secret_key,
+        keypair.public_key,
+        address(2),
+        10,
+        1,
+        0,
+    );
+    let low_fee_hash = low_fee.hash();
+    let mut mempool = Mempool::with_config(MempoolConfig {
+        min_relay_fee: 1,
+        market_fee: 5,
+        low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
+        transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+        ..MempoolConfig::default()
+    });
+
+    mempool.insert_at(low_fee, 1_000).unwrap();
+
+    assert_eq!(mempool.prune_expired(1_000 + LOW_FEE_EXPIRY_SECS + 1), 1);
+    assert!(!mempool.contains(&low_fee_hash));
+}
+
+#[test]
+fn keeps_market_fee_transactions_until_full_mempool_expiry() {
+    let transaction = signed_transaction_at(0, 1_000);
+    let hash = transaction.hash();
+    let mut mempool = Mempool::with_config(MempoolConfig {
+        market_fee: BASE_FEE,
+        low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
+        transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+        ..MempoolConfig::default()
+    });
+
+    mempool.insert_at(transaction, 1_000).unwrap();
+
+    assert_eq!(mempool.prune_expired(1_000 + LOW_FEE_EXPIRY_SECS + 1), 0);
+    assert!(mempool.contains(&hash));
+    assert_eq!(mempool.prune_expired(1_000 + MEMPOOL_EXPIRY_SECS + 1), 1);
+    assert!(!mempool.contains(&hash));
+}
+
+#[test]
 fn insert_prunes_expired_transactions_before_capacity_check() {
     let mut mempool = Mempool::with_config(MempoolConfig {
         max_transactions: 1,
         max_bytes: crate::runtime::params::MAX_MEMPOOL_BYTES,
         transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+        ..MempoolConfig::default()
     });
     let expired = signed_transaction_at(0, 1_000);
     let replacement = signed_transaction_at(1, 1_000 + MEMPOOL_EXPIRY_SECS + 1);
@@ -237,7 +318,7 @@ fn rejects_transaction_with_expired_timestamp() {
     assert_eq!(
         mempool.insert_at(
             transaction,
-            1_000 + crate::runtime::params::MAX_TRANSACTION_AGE as u64 + 1
+            1_000 + crate::runtime::params::MAX_RELAY_TRANSACTION_AGE_SECS + 1
         ),
         Err(MempoolError::InvalidTransaction(
             TransactionError::Expired
@@ -250,7 +331,7 @@ fn rejects_transaction_from_too_far_in_future() {
     let mut mempool = Mempool::new();
     let transaction = signed_transaction_at(
         0,
-        1_000 + crate::runtime::params::MAX_TRANSACTION_FUTURE_TIME as u64 + 1,
+        1_000 + crate::runtime::params::MAX_RELAY_TRANSACTION_FUTURE_SECS + 1,
     );
 
     assert_eq!(

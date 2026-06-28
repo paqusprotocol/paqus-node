@@ -1,7 +1,5 @@
 use crate::runtime::network::error::NetworkError;
-use crate::runtime::params::{
-    CHAIN_ID, CHAIN_NAME, MAX_NETWORK_MESSAGE_SIZE, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION,
-};
+use crate::runtime::params::{CURRENT_CHAIN_PARAMS, MAX_NETWORK_MESSAGE_SIZE};
 use borsh::{BorshDeserialize, BorshSerialize};
 use paqus::block::Block;
 use paqus::transaction::SignedTransaction;
@@ -21,7 +19,7 @@ pub struct TipInfo {
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct VersionInfo {
     pub protocol_version: u8,
-    pub chain_id: u8,
+    pub chain_id: u16,
     pub chain_name: String,
     pub protocol_stage: String,
     pub network_magic: [u8; 4],
@@ -31,26 +29,26 @@ pub struct VersionInfo {
 impl VersionInfo {
     pub fn local(tip: Option<TipInfo>) -> Self {
         Self {
-            protocol_version: PROTOCOL_VERSION,
-            chain_id: CHAIN_ID,
-            chain_name: CHAIN_NAME.to_string(),
-            protocol_stage: PROTOCOL_STAGE.to_string(),
-            network_magic: NETWORK_MAGIC,
+            protocol_version: CURRENT_CHAIN_PARAMS.protocol_version,
+            chain_id: CURRENT_CHAIN_PARAMS.chain_id,
+            chain_name: CURRENT_CHAIN_PARAMS.chain_name.to_string(),
+            protocol_stage: CURRENT_CHAIN_PARAMS.protocol_stage.to_string(),
+            network_magic: CURRENT_CHAIN_PARAMS.network_magic,
             tip,
         }
     }
 
     pub fn validate_compatibility(&self) -> Result<(), RejectReason> {
-        if self.network_magic != NETWORK_MAGIC {
+        if self.network_magic != CURRENT_CHAIN_PARAMS.network_magic {
             return Err(RejectReason::NetworkMismatch);
         }
-        if self.chain_id != CHAIN_ID
-            || self.chain_name != CHAIN_NAME
-            || self.protocol_stage != PROTOCOL_STAGE
+        if self.chain_id != CURRENT_CHAIN_PARAMS.chain_id
+            || self.chain_name != CURRENT_CHAIN_PARAMS.chain_name
+            || self.protocol_stage != CURRENT_CHAIN_PARAMS.protocol_stage
         {
             return Err(RejectReason::ChainMismatch);
         }
-        if self.protocol_version != PROTOCOL_VERSION {
+        if self.protocol_version != CURRENT_CHAIN_PARAMS.protocol_version {
             return Err(RejectReason::ProtocolVersionMismatch);
         }
         Ok(())
@@ -102,7 +100,7 @@ pub struct NetworkEnvelope {
 impl NetworkEnvelope {
     pub fn new(message: NetworkMessage) -> Self {
         Self {
-            magic: NETWORK_MAGIC,
+            magic: CURRENT_CHAIN_PARAMS.network_magic,
             message,
         }
     }
@@ -121,7 +119,7 @@ impl NetworkEnvelope {
         }
 
         let envelope = Self::try_from_slice(bytes)?;
-        if envelope.magic != NETWORK_MAGIC {
+        if envelope.magic != CURRENT_CHAIN_PARAMS.network_magic {
             return Err(NetworkError::Serialization(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "network magic mismatch",

@@ -1,6 +1,4 @@
-use crate::paquscore::{
-    CHAIN_ID, CHAIN_NAME, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, PeerInfo,
-};
+use crate::paquscore::{CURRENT_CHAIN_PARAMS, PeerInfo};
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -12,7 +10,7 @@ const GATEWAY_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 struct RegisterRequest {
     peer_id: Option<String>,
     address: String,
-    chain_id: u8,
+    chain_id: u16,
     chain_name: &'static str,
     protocol_stage: &'static str,
     protocol_version: u8,
@@ -70,10 +68,10 @@ pub fn register_peer(
     let request = RegisterRequest {
         peer_id: None,
         address: public_addr.to_string(),
-        chain_id: CHAIN_ID,
-        chain_name: CHAIN_NAME,
-        protocol_stage: PROTOCOL_STAGE,
-        protocol_version: PROTOCOL_VERSION,
+        chain_id: CURRENT_CHAIN_PARAMS.chain_id,
+        chain_name: CURRENT_CHAIN_PARAMS.chain_name,
+        protocol_stage: CURRENT_CHAIN_PARAMS.protocol_stage,
+        protocol_version: CURRENT_CHAIN_PARAMS.protocol_version,
         network_magic: network_magic_hex(),
         best_height,
         tip_hash,
@@ -102,7 +100,11 @@ pub fn request_gateway_peers(
     exclude: Option<SocketAddr>,
 ) -> Result<Vec<PeerInfo>, String> {
     let mut path = format!(
-        "/v1/peers?chain_id={CHAIN_ID}&chain_name={CHAIN_NAME}&protocol_stage={PROTOCOL_STAGE}&protocol_version={PROTOCOL_VERSION}&network_magic={}&limit={limit}",
+        "/v1/peers?chain_id={}&chain_name={}&protocol_stage={}&protocol_version={}&network_magic={}&limit={limit}",
+        CURRENT_CHAIN_PARAMS.chain_id,
+        CURRENT_CHAIN_PARAMS.chain_name,
+        CURRENT_CHAIN_PARAMS.protocol_stage,
+        CURRENT_CHAIN_PARAMS.protocol_version,
         network_magic_hex()
     );
     if let Some(exclude) = exclude {
@@ -219,5 +221,5 @@ fn content_length(line: &str) -> Option<usize> {
 }
 
 fn network_magic_hex() -> String {
-    hex::encode(NETWORK_MAGIC)
+    hex::encode(CURRENT_CHAIN_PARAMS.network_magic)
 }

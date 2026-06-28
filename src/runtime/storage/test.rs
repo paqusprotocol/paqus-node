@@ -1,5 +1,5 @@
 use super::{StateSnapshot, Storage, StorageError};
-use crate::runtime::params::{MIN_FEE, STORAGE_VERSION};
+use crate::runtime::params::{DEFAULT_TRANSACTION_FEE, STORAGE_VERSION};
 use paqus::block::Block;
 use paqus::crypto::{address_from_public_key, generate_keypair, sign};
 use paqus::ledger::Ledger;
@@ -25,7 +25,13 @@ fn block(height: u64, previous_hash: Hash) -> Block {
 fn signed_transaction(to: Address, amount: u32, nonce: u64) -> SignedTransaction {
     let keypair = generate_keypair();
     let from = address_from_public_key(&keypair.public_key);
-    let payload = Transaction::new(from, to, Amount(amount), Amount(MIN_FEE), Nonce(nonce));
+    let payload = Transaction::new(
+        from,
+        to,
+        Amount(amount),
+        Amount(DEFAULT_TRANSACTION_FEE),
+        Nonce(nonce),
+    );
     let signature = sign(&keypair.secret_key, &payload.signing_bytes());
     SignedTransaction::new(payload, keypair.public_key, signature)
 }

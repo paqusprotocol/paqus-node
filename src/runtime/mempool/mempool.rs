@@ -1,5 +1,9 @@
 use crate::runtime::mempool::error::MempoolError;
-use crate::runtime::params::{HASH_SIZE, MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TXS, MEMPOOL_EXPIRY_SECS};
+use crate::runtime::params::{
+    DEFAULT_MARKET_FEE, DEFAULT_MIN_RELAY_FEE, HASH_SIZE, LOW_FEE_EXPIRY_SECS, MAX_MEMPOOL_BYTES,
+    MAX_MEMPOOL_TXS, MAX_RELAY_TRANSACTION_AGE_SECS, MAX_RELAY_TRANSACTION_FUTURE_SECS,
+    MEMPOOL_EXPIRY_SECS, MIN_RELAY_FEE_FLOOR,
+};
 use paqus::block::{Block, CoinbaseTransaction};
 use paqus::ledger::{Ledger, LedgerError};
 use paqus::state::StateError;
@@ -20,6 +24,9 @@ pub struct MempoolConfig {
     pub max_transactions: usize,
     pub max_bytes: usize,
     pub transaction_ttl_secs: u64,
+    pub low_fee_ttl_secs: u64,
+    pub min_relay_fee: u32,
+    pub market_fee: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +41,9 @@ impl Default for MempoolConfig {
             max_transactions: MAX_MEMPOOL_TXS,
             max_bytes: MAX_MEMPOOL_BYTES,
             transaction_ttl_secs: MEMPOOL_EXPIRY_SECS,
+            low_fee_ttl_secs: LOW_FEE_EXPIRY_SECS,
+            min_relay_fee: DEFAULT_MIN_RELAY_FEE,
+            market_fee: DEFAULT_MARKET_FEE,
         }
     }
 }
@@ -68,7 +78,9 @@ impl Mempool {
         now: u64,
     ) -> Result<TransactionHash, MempoolError> {
         self.prune_expired(now);
+        self.validate_timestamp_policy(&transaction, now)?;
         transaction.validate_signed_at(now)?;
+        self.validate_fee_policy(&transaction)?;
         self.insert_unchecked(transaction, now, None)
     }
 
@@ -87,7 +99,9 @@ impl Mempool {
         now: u64,
     ) -> Result<TransactionHash, MempoolError> {
         self.prune_expired(now);
+        self.validate_timestamp_policy(&transaction, now)?;
         transaction.validate_signed_at(now)?;
+        self.validate_fee_policy(&transaction)?;
         let replacement = self.replacement_candidate(&transaction)?;
         self.validate_against_ledger_excluding(ledger, &transaction, replacement)?;
         self.insert_unchecked(transaction, now, replacement)
@@ -161,12 +175,40 @@ impl Mempool {
         Ok(Some(hash))
     }
 
+    fn validate_fee_policy(&self, transaction: &SignedTransaction) -> Result<(), MempoolError> {
+        let min_relay_fee = self.config.min_relay_fee.max(MIN_RELAY_FEE_FLOOR);
+        if transaction.transaction.fee.0 < min_relay_fee {
+            return Err(MempoolError::FeeTooLow);
+        }
+        Ok(())
+    }
+
+    fn validate_timestamp_policy(
+        &self,
+        transaction: &SignedTransaction,
+        now: u64,
+    ) -> Result<(), MempoolError> {
+        if transaction.transaction.timestamp > now.saturating_add(MAX_RELAY_TRANSACTION_FUTURE_SECS)
+        {
+            return Err(MempoolError::InvalidTransaction(
+                paqus::transaction::TransactionError::FromFuture,
+            ));
+        }
+        if now.saturating_sub(transaction.transaction.timestamp) > MAX_RELAY_TRANSACTION_AGE_SECS {
+            return Err(MempoolError::InvalidTransaction(
+                paqus::transaction::TransactionError::Expired,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_against_ledger(
         &self,
         ledger: &Ledger,
         transaction: &SignedTransaction,
     ) -> Result<(), MempoolError> {
         transaction.validate_signed()?;
+        self.validate_fee_policy(transaction)?;
         self.validate_against_ledger_excluding(ledger, transaction, None)
     }
 
@@ -177,6 +219,7 @@ impl Mempool {
         excluded: Option<TransactionHash>,
     ) -> Result<(), MempoolError> {
         transaction.validate_signed()?;
+        self.validate_fee_policy(transaction)?;
 
         let payload = &transaction.transaction;
         let sender = ledger
@@ -270,9 +313,13 @@ impl Mempool {
 
     pub fn prune_expired(&mut self, now: u64) -> usize {
         let before = self.transactions.len();
-        let ttl = self.config.transaction_ttl_secs;
         let mut retained_bytes = 0_usize;
         self.transactions.retain(|_, entry| {
+            let ttl = if entry.transaction.transaction.fee.0 < self.config.market_fee {
+                self.config.low_fee_ttl_secs
+            } else {
+                self.config.transaction_ttl_secs
+            };
             let retain = now.saturating_sub(entry.inserted_at) <= ttl;
             if retain {
                 retained_bytes = retained_bytes.saturating_add(entry.transaction.serialized_size());
@@ -412,18 +459,102 @@ mod tests {
         amount: u32,
         nonce: u64,
     ) -> SignedTransaction {
+        signed_transaction_from_with_fee_at(
+            secret_key,
+            public_key,
+            to,
+            amount,
+            crate::runtime::params::DEFAULT_TRANSACTION_FEE,
+            nonce,
+            current_unix_timestamp(),
+        )
+    }
+
+    fn signed_transaction_from_with_fee_at(
+        secret_key: &paqus::types::SecretKey,
+        public_key: paqus::types::PublicKey,
+        to: Address,
+        amount: u32,
+        fee: u32,
+        nonce: u64,
+        timestamp: u64,
+    ) -> SignedTransaction {
         let from = address_from_public_key(&public_key);
         let payload = Transaction::new_at(
             from,
             to,
             Amount(amount),
-            Amount(paqus::params::MIN_FEE),
+            Amount(fee),
             Nonce(nonce),
-            current_unix_timestamp(),
+            timestamp,
         );
         let signature = sign(secret_key, &payload.signing_bytes());
 
         SignedTransaction::new(payload, public_key, signature)
+    }
+
+    #[test]
+    fn prunes_low_fee_transactions_after_low_fee_expiry() {
+        let keypair = generate_keypair();
+        let transaction = signed_transaction_from_with_fee_at(
+            &keypair.secret_key,
+            keypair.public_key,
+            address(2),
+            10,
+            1,
+            0,
+            1_000,
+        );
+        let hash = transaction.hash();
+        let mut mempool = Mempool::with_config(MempoolConfig {
+            min_relay_fee: 1,
+            market_fee: 5,
+            low_fee_ttl_secs: crate::runtime::params::LOW_FEE_EXPIRY_SECS,
+            transaction_ttl_secs: crate::runtime::params::MEMPOOL_EXPIRY_SECS,
+            ..MempoolConfig::default()
+        });
+
+        mempool.insert_at(transaction, 1_000).unwrap();
+
+        assert_eq!(
+            mempool.prune_expired(1_000 + crate::runtime::params::LOW_FEE_EXPIRY_SECS + 1),
+            1
+        );
+        assert!(!mempool.contains(&hash));
+    }
+
+    #[test]
+    fn keeps_market_fee_transactions_until_full_mempool_expiry() {
+        let keypair = generate_keypair();
+        let transaction = signed_transaction_from_with_fee_at(
+            &keypair.secret_key,
+            keypair.public_key,
+            address(2),
+            10,
+            crate::runtime::params::DEFAULT_MARKET_FEE,
+            0,
+            1_000,
+        );
+        let hash = transaction.hash();
+        let mut mempool = Mempool::with_config(MempoolConfig {
+            market_fee: crate::runtime::params::DEFAULT_MARKET_FEE,
+            low_fee_ttl_secs: crate::runtime::params::LOW_FEE_EXPIRY_SECS,
+            transaction_ttl_secs: crate::runtime::params::MEMPOOL_EXPIRY_SECS,
+            ..MempoolConfig::default()
+        });
+
+        mempool.insert_at(transaction, 1_000).unwrap();
+
+        assert_eq!(
+            mempool.prune_expired(1_000 + crate::runtime::params::LOW_FEE_EXPIRY_SECS + 1),
+            0
+        );
+        assert!(mempool.contains(&hash));
+        assert_eq!(
+            mempool.prune_expired(1_000 + crate::runtime::params::MEMPOOL_EXPIRY_SECS + 1),
+            1
+        );
+        assert!(!mempool.contains(&hash));
     }
 
     #[test]

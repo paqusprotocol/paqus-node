@@ -6,6 +6,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MempoolError {
     DuplicateTransaction,
+    FeeTooLow,
     MempoolFull,
     ReplacementFeeTooLow,
     InvalidTransaction(TransactionError),
@@ -18,6 +19,7 @@ impl fmt::Display for MempoolError {
             MempoolError::DuplicateTransaction => {
                 f.write_str("transaction already exists in mempool")
             }
+            MempoolError::FeeTooLow => f.write_str("transaction fee is below node policy"),
             MempoolError::MempoolFull => f.write_str("mempool transaction limit reached"),
             MempoolError::ReplacementFeeTooLow => {
                 f.write_str("replacement transaction fee must be higher")
@@ -34,6 +36,7 @@ impl Error for MempoolError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             MempoolError::DuplicateTransaction => None,
+            MempoolError::FeeTooLow => None,
             MempoolError::MempoolFull => None,
             MempoolError::ReplacementFeeTooLow => None,
             MempoolError::InvalidTransaction(error) => Some(error),

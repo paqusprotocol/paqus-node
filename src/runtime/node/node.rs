@@ -307,6 +307,12 @@ impl Node {
         );
     }
 
+    pub fn has_pending_sync_work(&self) -> bool {
+        !self.orphan_blocks.is_empty()
+            || !self.missing_parent_requests.is_empty()
+            || !self.missing_parent_retry_at.is_empty()
+    }
+
     fn orphan_is_too_far_ahead(&self, block: &Block) -> bool {
         let tip_height = self.ledger.tip_height().map(|height| height.0).unwrap_or(0);
         block.height().0 > tip_height.saturating_add(MAX_ORPHAN_HEIGHT_DISTANCE)
@@ -761,7 +767,7 @@ mod tests {
             sender,
             receiver,
             Amount(200),
-            Amount(paqus::params::MIN_FEE),
+            Amount(crate::runtime::params::DEFAULT_TRANSACTION_FEE),
             Nonce(0),
         );
         let signature = sign(&keypair.secret_key, &transaction.signing_bytes());
@@ -865,7 +871,7 @@ mod tests {
         assert_eq!(
             node.next_difficulty_after_branch_tip(previous_hash)
                 .unwrap(),
-            2
+            5
         );
     }
 

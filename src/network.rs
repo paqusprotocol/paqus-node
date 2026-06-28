@@ -1,4 +1,5 @@
 use crate::paquscore::{NetworkMessage, read_message, write_message};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
@@ -6,8 +7,23 @@ use std::time::Duration;
 const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn bind_nonblocking(addr: SocketAddr, label: &str) -> Result<TcpListener, String> {
-    let listener = TcpListener::bind(addr)
-        .map_err(|error| format!("failed to bind {label} {addr}: {error}"))?;
+    let listener = if addr.is_ipv6() {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|error| format!("failed to create {label} IPv6 socket: {error}"))?;
+        socket
+            .set_only_v6(true)
+            .map_err(|error| format!("failed to set {label} IPv6-only mode: {error}"))?;
+        socket
+            .bind(&SockAddr::from(addr))
+            .map_err(|error| format!("failed to bind {label} {addr}: {error}"))?;
+        socket
+            .listen(1024)
+            .map_err(|error| format!("failed to listen on {label} {addr}: {error}"))?;
+        socket.into()
+    } else {
+        TcpListener::bind(addr)
+            .map_err(|error| format!("failed to bind {label} {addr}: {error}"))?
+    };
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("failed to set {label} listener nonblocking: {error}"))?;

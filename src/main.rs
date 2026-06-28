@@ -30,25 +30,29 @@ use paquscore::{
 };
 use paquscore::{
     BLOCK_REWARD_MATURITY, BLOCK_TIME, CHAIN_ID, CHAIN_NAME, COIN_NAME, CONFIRMATION_DEPTH,
-    DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH, MAX_BLOCK_TXS, MIN_FEE,
-    NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
+    DEFAULT_TRANSACTION_FEE, DIFFICULTY_ADJUSTMENT_INTERVAL, DIFFICULTY_START, FINALITY_DEPTH,
+    MAX_BLOCK_TXS, NETWORK_MAGIC, PROTOCOL_STAGE, PROTOCOL_VERSION, STORAGE_VERSION,
 };
+use runtime::mempool::MempoolConfig;
 use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::env;
 use std::fs;
 use std::io;
 use std::io::Write as IoWrite;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NODE_DB: &str = "./data/paqus";
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:30333";
-const DEFAULT_RPC_ADDR: &str = "127.0.0.1:9933";
+const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:5555";
+const DEFAULT_RPC_ADDR: &str = "127.0.0.1:6666";
 const DEFAULT_CONFIG_FILE: &str = "./data/paqus/node.json";
 const DEFAULT_PEERS_FILE: &str = "./data/paqus/peers.json";
 const DEFAULT_MINING_INTERVAL: Duration = Duration::from_secs(BLOCK_TIME as u64);
@@ -161,7 +165,13 @@ fn menu_send() -> Result<(), String> {
     };
     let to = parse_address(Some(&prompt("Recipient address")?))?;
     let amount = parse_amount(Some(&prompt("Amount")?), "amount")?;
-    let fee = parse_amount(Some(&prompt_default("Fee", &MIN_FEE.to_string())?), "fee")?;
+    let fee = parse_amount(
+        Some(&prompt_default(
+            "Fee",
+            &DEFAULT_TRANSACTION_FEE.to_string(),
+        )?),
+        "fee",
+    )?;
     let rpc_addr = prompt_default("RPC address", DEFAULT_RPC_ADDR)?;
     submit_wallet_payment(&wallet_path, to, amount, fee, None, &rpc_addr)
 }
@@ -362,7 +372,7 @@ fn wallet_pay_command(args: &[String]) -> Result<(), String> {
     let amount = parse_amount(args.get(1), "amount")?;
     let mut wallet_path = "wallet.json".to_string();
     let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
-    let mut fee = Amount(MIN_FEE);
+    let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
     let mut index = 2;
 
     while index < args.len() {
@@ -400,7 +410,7 @@ fn wallet_send_command(args: &[String]) -> Result<(), String> {
         let amount = parse_amount(args.get(1), "amount")?;
         let mut wallet_path = "wallet.json".to_string();
         let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
-        let mut fee = Amount(MIN_FEE);
+        let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
         let mut nonce = None;
         let mut index = 2;
 
@@ -439,7 +449,7 @@ fn wallet_send_command(args: &[String]) -> Result<(), String> {
     let mut wallet_path = None;
     let mut to = None;
     let mut amount = None;
-    let mut fee = Amount(MIN_FEE);
+    let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
     let mut nonce = None;
     let mut rpc_addr = DEFAULT_RPC_ADDR.to_string();
     let mut submit = false;
@@ -592,15 +602,19 @@ fn node_config_command(args: &[String]) -> Result<(), String> {
 #[derive(Debug)]
 struct RunConfig {
     db_path: String,
-    listen_addr: SocketAddr,
+    listen_addrs: Vec<SocketAddr>,
     rpc_addr: SocketAddr,
     peers: Vec<SocketAddr>,
     peers_file: Option<String>,
     gateway_url: Option<String>,
-    public_addr: Option<SocketAddr>,
+    public_addrs: Vec<SocketAddr>,
     gateway_heartbeat: Duration,
     shutdown_file: String,
     max_peers: usize,
+    min_relay_fee: u32,
+    market_fee: u32,
+    low_fee_expiry: Duration,
+    mempool_expiry: Duration,
     miner_address: Address,
     miner_secret_key: Option<SecretKey>,
     mine: bool,
@@ -611,21 +625,45 @@ struct RunConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunConfigFile {
     db_path: String,
-    listen_addr: String,
+    listen_addr: OneOrMany<String>,
     rpc_addr: String,
     peers: Vec<String>,
     peers_file: Option<String>,
     gateway_url: Option<String>,
-    public_addr: Option<String>,
+    public_addr: Option<OneOrMany<String>>,
     gateway_heartbeat_secs: u64,
     shutdown_file: String,
     max_peers: usize,
+    #[serde(default)]
+    min_relay_fee: Option<u32>,
+    #[serde(default)]
+    market_fee: Option<u32>,
+    #[serde(default)]
+    low_fee_expiry_secs: Option<u64>,
+    #[serde(default)]
+    mempool_expiry_secs: Option<u64>,
     wallet: Option<String>,
     miner_address: Option<String>,
     miner_secret_key: Option<String>,
     mine: bool,
     mine_interval_secs: u64,
     mine_attempts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,6 +682,13 @@ struct RpcState {
     node: Arc<Mutex<Node>>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
     mining: bool,
+    log_counters: Arc<LogCounters>,
+}
+
+#[derive(Default)]
+struct LogCounters {
+    accepted_tx_total: AtomicU64,
+    broadcast_tx_total: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -767,19 +812,25 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             db_path: DEFAULT_NODE_DB.to_string(),
-            listen_addr: DEFAULT_LISTEN_ADDR
-                .parse()
-                .expect("default listen address must be valid"),
+            listen_addrs: vec![
+                DEFAULT_LISTEN_ADDR
+                    .parse()
+                    .expect("default listen address must be valid"),
+            ],
             rpc_addr: DEFAULT_RPC_ADDR
                 .parse()
                 .expect("default rpc address must be valid"),
             peers: Vec::new(),
             peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
             gateway_url: None,
-            public_addr: None,
+            public_addrs: Vec::new(),
             gateway_heartbeat: DEFAULT_GATEWAY_HEARTBEAT,
             shutdown_file: DEFAULT_SHUTDOWN_FILE.to_string(),
             max_peers: DEFAULT_MAX_PEERS,
+            min_relay_fee: runtime::params::DEFAULT_MIN_RELAY_FEE,
+            market_fee: runtime::params::DEFAULT_MARKET_FEE,
+            low_fee_expiry: Duration::from_secs(runtime::params::LOW_FEE_EXPIRY_SECS),
+            mempool_expiry: Duration::from_secs(runtime::params::MEMPOOL_EXPIRY_SECS),
             miner_address: Address([9; 20]),
             miner_secret_key: None,
             mine: false,
@@ -794,7 +845,13 @@ impl Default for RunConfigFile {
         let defaults = RunConfig::default();
         Self {
             db_path: defaults.db_path,
-            listen_addr: defaults.listen_addr.to_string(),
+            listen_addr: OneOrMany::Many(
+                defaults
+                    .listen_addrs
+                    .into_iter()
+                    .map(|addr| addr.to_string())
+                    .collect(),
+            ),
             rpc_addr: defaults.rpc_addr.to_string(),
             peers: Vec::new(),
             peers_file: Some(DEFAULT_PEERS_FILE.to_string()),
@@ -803,6 +860,10 @@ impl Default for RunConfigFile {
             gateway_heartbeat_secs: defaults.gateway_heartbeat.as_secs(),
             shutdown_file: defaults.shutdown_file,
             max_peers: defaults.max_peers,
+            min_relay_fee: Some(defaults.min_relay_fee),
+            market_fee: Some(defaults.market_fee),
+            low_fee_expiry_secs: Some(defaults.low_fee_expiry.as_secs()),
+            mempool_expiry_secs: Some(defaults.mempool_expiry.as_secs()),
             wallet: None,
             miner_address: None,
             miner_secret_key: None,
@@ -816,8 +877,10 @@ impl Default for RunConfigFile {
 struct NodeService {
     node: Arc<Mutex<Node>>,
     config: RunConfig,
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    log_counters: Arc<LogCounters>,
+    requires_peer_sync_before_mining: bool,
     last_mine: Instant,
     last_status: Instant,
     last_gateway_heartbeat: Instant,
@@ -836,7 +899,14 @@ enum NodeActivity {
 }
 
 impl NodeService {
-    fn new(node: Arc<Mutex<Node>>, config: RunConfig, listener: TcpListener) -> Self {
+    fn new(
+        node: Arc<Mutex<Node>>,
+        config: RunConfig,
+        listeners: Vec<TcpListener>,
+        log_counters: Arc<LogCounters>,
+    ) -> Self {
+        let requires_peer_sync_before_mining =
+            config.mine && (!config.peers.is_empty() || config.gateway_url.is_some());
         let peers = config
             .peers
             .iter()
@@ -849,8 +919,10 @@ impl NodeService {
         Self {
             node,
             config,
-            listener,
+            listeners,
             peers: Arc::new(Mutex::new(peers)),
+            log_counters,
+            requires_peer_sync_before_mining,
             last_mine: Instant::now(),
             last_status: Instant::now(),
             last_gateway_heartbeat,
@@ -912,15 +984,10 @@ impl NodeService {
         for peer in peers {
             let result = poll_peer(peer, &self.node);
             match result {
-                Ok(PeerPoll::Idle) | Ok(PeerPoll::Synced) => {
-                    let tip = self
-                        .node
-                        .lock()
-                        .map_err(|_| "node state lock poisoned".to_string())?
-                        .tip_height();
+                Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_ok(tip);
+                            state.mark_ok(Some(remote_tip));
                         }
                     }
                 }
@@ -934,6 +1001,7 @@ impl NodeService {
                 }
             }
         }
+        self.save_peers()?;
 
         let node = self
             .node
@@ -967,17 +1035,21 @@ impl NodeService {
             self.log_activity()?;
 
             if self.config.mine && self.last_mine.elapsed() >= self.config.mine_interval {
-                self.set_activity(NodeActivity::Mining)?;
-                let block = mine_once_unlocked(&self.node, &self.config)?;
-                if let Some(block) = block {
-                    let height = block.height().0;
-                    let hash = short_hash(Some(block.hash()));
-                    let tx_count = block.transactions.len();
-                    let report = self.broadcast(NetworkMessage::Block(block));
-                    println!(
-                        "broadcasting block height {} |hash::{}|txs::{}|peers::{}|sent::{}|failed::{}|",
-                        height, hash, tx_count, report.attempted, report.sent, report.failed
-                    );
+                if let Some(reason) = self.mining_wait_reason()? {
+                    println!("mining waiting:: |reason::{reason}|");
+                } else {
+                    self.set_activity(NodeActivity::Mining)?;
+                    let block = mine_once_unlocked(&self.node, &self.config)?;
+                    if let Some(block) = block {
+                        let height = block.height().0;
+                        let hash = short_hash(Some(block.hash()));
+                        let tx_count = block.transactions.len();
+                        let report = self.broadcast(NetworkMessage::Block(block));
+                        println!(
+                            "broadcast block:: |height::{}|hash::{}|txs::{}|peers::{}|sent::{}|failed::{}|",
+                            height, hash, tx_count, report.attempted, report.sent, report.failed
+                        );
+                    }
                 }
                 self.last_mine = Instant::now();
             }
@@ -993,13 +1065,14 @@ impl NodeService {
                     .map_err(|_| "peer state lock poisoned".to_string())?
                     .len();
                 println!(
-                    "status: |height::{}|tip::{}|difficulty::{}|mempool::{}|peers::{}|mining::{}",
+                    "status: |height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|accepted_tx::{}|broadcast_tx::{}|",
                     node.tip_height().unwrap_or(Height(0)).0,
                     short_hash(node.tip_hash()),
                     format_difficulty(node.next_difficulty()),
-                    node.mempool.len(),
                     peer_count,
-                    self.config.mine
+                    self.config.mine,
+                    self.log_counters.accepted_tx_total.load(Ordering::Relaxed),
+                    self.log_counters.broadcast_tx_total.load(Ordering::Relaxed)
                 );
                 self.last_status = Instant::now();
             }
@@ -1032,16 +1105,15 @@ impl NodeService {
     }
 
     fn log_activity(&mut self) -> Result<(), String> {
-        let (height, tip, mempool_len, mining) = {
+        let (mempool_len, mining, pending_sync) = {
             let node = self
                 .node
                 .lock()
                 .map_err(|_| "node state lock poisoned".to_string())?;
             (
-                node.tip_height().unwrap_or(Height(0)).0,
-                short_hash(node.tip_hash()),
                 node.mempool.len(),
                 self.config.mine,
+                node.has_pending_sync_work(),
             )
         };
         let peer_count = self
@@ -1052,6 +1124,11 @@ impl NodeService {
 
         let activity = if peer_count == 0 && self.config.gateway_url.is_some() {
             NodeActivity::WaitingForPeers
+        } else if pending_sync
+            || (self.requires_peer_sync_before_mining && !self.has_successful_peer_handshake()?)
+            || self.peer_ahead_of_local_tip()?
+        {
+            NodeActivity::Syncing
         } else if mining && mempool_len == 0 {
             NodeActivity::WaitingForTransactions
         } else if mining {
@@ -1065,15 +1142,55 @@ impl NodeService {
         if activity != self.last_activity
             || self.last_activity_log.elapsed() >= ACTIVITY_LOG_INTERVAL
         {
-            println!(
-                "node activity:: |state::{:?}|height::{}|tip::{}|mempool::{}|peers::{}|mining::{}|",
-                activity, height, tip, mempool_len, peer_count, mining
-            );
             self.last_activity = activity;
             self.last_activity_log = Instant::now();
         }
 
         Ok(())
+    }
+
+    fn mining_wait_reason(&self) -> Result<Option<&'static str>, String> {
+        let pending_sync = self
+            .node
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?
+            .has_pending_sync_work();
+        if pending_sync {
+            return Ok(Some("sync_pending"));
+        }
+        if self.requires_peer_sync_before_mining && !self.has_successful_peer_handshake()? {
+            return Ok(Some("handshake_pending"));
+        }
+        if self.peer_ahead_of_local_tip()? {
+            return Ok(Some("peer_ahead"));
+        }
+        Ok(None)
+    }
+
+    fn has_successful_peer_handshake(&self) -> Result<bool, String> {
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| "peer state lock poisoned".to_string())?;
+        Ok(peers.values().any(|peer| peer.last_tip.is_some()))
+    }
+
+    fn peer_ahead_of_local_tip(&self) -> Result<bool, String> {
+        let local_height = self
+            .node
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?
+            .tip_height()
+            .unwrap_or(Height(0))
+            .0;
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| "peer state lock poisoned".to_string())?;
+        Ok(peers
+            .values()
+            .filter_map(|peer| peer.last_tip)
+            .any(|height| height.0 > local_height))
     }
 
     fn set_activity(&mut self, activity: NodeActivity) -> Result<(), String> {
@@ -1082,26 +1199,6 @@ impl NodeService {
         {
             return Ok(());
         }
-        let (height, tip, mempool_len) = {
-            let node = self
-                .node
-                .lock()
-                .map_err(|_| "node state lock poisoned".to_string())?;
-            (
-                node.tip_height().unwrap_or(Height(0)).0,
-                short_hash(node.tip_hash()),
-                node.mempool.len(),
-            )
-        };
-        let peer_count = self
-            .peers
-            .lock()
-            .map_err(|_| "peer state lock poisoned".to_string())?
-            .len();
-        println!(
-            "node activity:: |state::{:?}|height::{}|tip::{}|mempool::{}|peers::{}|mining::{}|",
-            activity, height, tip, mempool_len, peer_count, self.config.mine
-        );
         self.last_activity = activity;
         self.last_activity_log = Instant::now();
         Ok(())
@@ -1109,14 +1206,21 @@ impl NodeService {
 
     fn accept_p2p(&mut self) -> Result<(), String> {
         loop {
-            match self.listener.accept() {
-                Ok((stream, peer)) => {
-                    self.set_activity(NodeActivity::ServingPeers)?;
-                    println!("p2p inbound:: |peer::{}|event::accepted|", peer);
-                    self.handle_p2p_stream(stream, peer)?;
+            let mut accepted = false;
+            for index in 0..self.listeners.len() {
+                match self.listeners[index].accept() {
+                    Ok((stream, peer)) => {
+                        accepted = true;
+                        self.set_activity(NodeActivity::ServingPeers)?;
+                        println!("p2p inbound:: |peer::{}|event::accepted|", peer);
+                        self.handle_p2p_stream(stream, peer)?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(format!("failed to accept peer: {error}")),
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(format!("failed to accept peer: {error}")),
+            }
+            if !accepted {
+                return Ok(());
             }
         }
     }
@@ -1128,8 +1232,9 @@ impl NodeService {
                 let response = match envelope.message {
                     NetworkMessage::GetPeers => Some(NetworkMessage::Peers(self.peer_infos())),
                     NetworkMessage::Peers(peers) => {
-                        self.add_peer_infos(peers);
-                        let _ = self.save_peers();
+                        if self.add_peer_infos(peers) {
+                            let _ = self.save_peers();
+                        }
                         None
                     }
                     message => {
@@ -1172,22 +1277,16 @@ impl NodeService {
         for peer in due_peers {
             let result = poll_peer(peer, &self.node);
             match result {
-                Ok(PeerPoll::Idle) | Ok(PeerPoll::Synced) => {
-                    let tip = match self.node.lock() {
-                        Ok(node) => node.tip_height(),
-                        Err(_) => {
-                            eprintln!("node state lock poisoned");
-                            return;
-                        }
-                    };
+                Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
                         if let Some(state) = peers.get_mut(&peer) {
-                            state.mark_ok(tip);
+                            state.mark_ok(Some(remote_tip));
                         }
                     }
                     if let Ok(infos) = request_peers(peer) {
-                        self.add_peer_infos(infos);
-                        let _ = self.save_peers();
+                        if self.add_peer_infos(infos) {
+                            let _ = self.save_peers();
+                        }
                     }
                 }
                 Err(error) => {
@@ -1214,12 +1313,13 @@ impl NodeService {
         }
     }
 
-    fn add_peer_infos(&mut self, peers: Vec<PeerInfo>) {
+    fn add_peer_infos(&mut self, peers: Vec<PeerInfo>) -> bool {
         let Ok(mut current) = self.peers.lock() else {
             eprintln!("peer state lock poisoned");
-            return;
+            return false;
         };
         let known = current.keys().copied().collect::<HashSet<_>>();
+        let mut changed = false;
         for info in peers {
             if current.len() >= self.config.max_peers {
                 break;
@@ -1227,14 +1327,19 @@ impl NodeService {
             let Ok(addr) = info.address.parse::<SocketAddr>() else {
                 continue;
             };
-            if Some(addr) == self.config.public_addr || addr == self.config.listen_addr {
+            if self.config.public_addrs.contains(&addr) || self.config.listen_addrs.contains(&addr)
+            {
                 continue;
             }
             if known.contains(&addr) {
                 continue;
             }
-            current.entry(addr).or_insert_with(|| PeerState::new(addr));
+            if let Entry::Vacant(entry) = current.entry(addr) {
+                entry.insert(PeerState::new(addr));
+                changed = true;
+            }
         }
+        changed
     }
 
     fn refresh_gateway_peers(&mut self, register: bool) {
@@ -1253,17 +1358,21 @@ impl NodeService {
             }
         };
 
-        if let Some(public_addr) = self.config.public_addr {
-            let result = if register {
-                register_peer(&gateway_url, public_addr, best_height, tip_hash.clone())
-            } else {
-                heartbeat_peer(&gateway_url, public_addr, best_height, tip_hash.clone())
-            };
-            if let Err(error) = result {
-                eprintln!("gateway update failed: {error}");
+        if self.config.public_addrs.is_empty() {
+            if register {
+                eprintln!("gateway configured without --public-addr; querying peers only");
             }
-        } else if register {
-            eprintln!("gateway configured without --public-addr; querying peers only");
+        } else {
+            for public_addr in &self.config.public_addrs {
+                let result = if register {
+                    register_peer(&gateway_url, *public_addr, best_height, tip_hash.clone())
+                } else {
+                    heartbeat_peer(&gateway_url, *public_addr, best_height, tip_hash.clone())
+                };
+                if let Err(error) = result {
+                    eprintln!("gateway update failed for {public_addr}: {error}");
+                }
+            }
         }
 
         let available = match self.peers.lock() {
@@ -1277,13 +1386,18 @@ impl NodeService {
             match request_gateway_peers(
                 &gateway_url,
                 available.min(32),
-                self.config.public_addr.or(Some(self.config.listen_addr)),
+                self.config
+                    .public_addrs
+                    .first()
+                    .or_else(|| self.config.listen_addrs.first())
+                    .copied(),
             ) {
                 Ok(peers) => {
                     if !peers.is_empty() {
-                        println!("gateway discovered {} peer(s)", peers.len());
-                        self.add_peer_infos(peers);
-                        let _ = self.save_peers();
+                        println!("gateway discovered peer::{}|", peers.len());
+                        if self.add_peer_infos(peers) {
+                            let _ = self.save_peers();
+                        }
                     }
                 }
                 Err(error) => eprintln!("gateway peer query failed: {error}"),
@@ -1321,7 +1435,7 @@ impl NodeService {
                 address: addr.to_string(),
             })
             .collect::<Vec<_>>();
-        if let Some(public_addr) = self.config.public_addr {
+        for public_addr in &self.config.public_addrs {
             infos.push(PeerInfo {
                 address: public_addr.to_string(),
             });
@@ -1696,21 +1810,15 @@ async fn rpc_submit_tx(
         }
         Err(_) => return rpc_error(StatusCode::INTERNAL_SERVER_ERROR, "state_lock_failed"),
     }
-    println!(
-        "accepted tx:: |hash::{}|amount::{}|fee::{}|nonce::{}|",
-        short_hash(Some(hash)),
-        transaction.transaction.amount.0,
-        transaction.transaction.fee.0,
-        transaction.transaction.nonce.0
-    );
-    let report = broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
-    println!(
-        "broadcast tx:: |hash::{}|peers::{}|sent::{}|failed::{}|",
-        short_hash(Some(hash)),
-        report.attempted,
-        report.sent,
-        report.failed
-    );
+    state
+        .log_counters
+        .accepted_tx_total
+        .fetch_add(1, Ordering::Relaxed);
+    let _report = broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
+    state
+        .log_counters
+        .broadcast_tx_total
+        .fetch_add(1, Ordering::Relaxed);
     Json(SubmitTxResponse {
         accepted: true,
         hash: hex::encode(hash.0),
@@ -1865,14 +1973,34 @@ fn run_node(args: &[String]) -> Result<(), String> {
     if config.peers.len() > config.max_peers {
         config.peers.truncate(config.max_peers);
     }
-    let node = open_node(&config.db_path, config.miner_address)?;
-    let listener = bind_nonblocking(config.listen_addr, "p2p")?;
-    let listen_addr = listener
-        .local_addr()
-        .map_err(|error| format!("failed to read listener address: {error}"))?;
+    let mut node = open_node(&config.db_path, config.miner_address)?;
+    node.mempool = runtime::mempool::Mempool::with_config(MempoolConfig {
+        min_relay_fee: config.min_relay_fee,
+        market_fee: config.market_fee,
+        low_fee_ttl_secs: config.low_fee_expiry.as_secs(),
+        transaction_ttl_secs: config.mempool_expiry.as_secs(),
+        ..MempoolConfig::default()
+    });
+    if config.listen_addrs.is_empty() {
+        return Err("at least one --listen address is required".to_string());
+    }
+    dedupe_socket_addrs(&mut config.listen_addrs);
+    dedupe_socket_addrs(&mut config.public_addrs);
+    let mut listeners = Vec::new();
+    let mut bound_addrs = Vec::new();
+    for addr in &config.listen_addrs {
+        let listener = bind_nonblocking(*addr, "p2p")?;
+        bound_addrs.push(
+            listener
+                .local_addr()
+                .map_err(|error| format!("failed to read listener address: {error}"))?,
+        );
+        listeners.push(listener);
+    }
     let node = Arc::new(Mutex::new(node));
+    let log_counters = Arc::new(LogCounters::default());
 
-    let mut service = NodeService::new(node.clone(), config, listener);
+    let mut service = NodeService::new(node.clone(), config, listeners, log_counters.clone());
     service.preflight()?;
 
     let (height, tip_hash, difficulty) = {
@@ -1887,21 +2015,26 @@ fn run_node(args: &[String]) -> Result<(), String> {
     };
 
     println!(
-        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}",
+        "Paqus Node db::{}|p2p::{}|rpc::{}|height::{}|tip::{}|difficulty::{}|peers::{}|mining::{}|min_relay_fee::{}|market_fee::{}|low_fee_expiry::{}s|mempool_expiry::{}s",
         service.config.db_path,
-        listen_addr,
+        format_socket_addrs(&bound_addrs),
         service.config.rpc_addr,
         height,
         tip_hash,
         difficulty,
         service.config.peers.len(),
-        service.config.mine
+        service.config.mine,
+        service.config.min_relay_fee,
+        service.config.market_fee,
+        service.config.low_fee_expiry.as_secs(),
+        service.config.mempool_expiry.as_secs()
     );
 
     let rpc_state = RpcState {
         node,
         peers: service.peers.clone(),
         mining: service.config.mine,
+        log_counters,
     };
     let _rpc_handle = start_rpc_server(rpc_state, service.config.rpc_addr)?;
     service.run()
@@ -1946,6 +2079,8 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
     if let Some(file_config) = load_run_config_file_if_exists(config_path)? {
         apply_run_config_file(&mut config, file_config)?;
     }
+    let mut listen_overridden = false;
+    let mut public_overridden = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -1964,7 +2099,13 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
             }
             "--listen" => {
                 index += 1;
-                config.listen_addr = parse_socket(args.get(index), "--listen")?;
+                if !listen_overridden {
+                    config.listen_addrs.clear();
+                    listen_overridden = true;
+                }
+                config
+                    .listen_addrs
+                    .push(parse_socket(args.get(index), "--listen")?);
             }
             "--rpc-listen" => {
                 index += 1;
@@ -1992,7 +2133,13 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
             }
             "--public-addr" => {
                 index += 1;
-                config.public_addr = Some(parse_socket(args.get(index), "--public-addr")?);
+                if !public_overridden {
+                    config.public_addrs.clear();
+                    public_overridden = true;
+                }
+                config
+                    .public_addrs
+                    .push(parse_socket(args.get(index), "--public-addr")?);
             }
             "--gateway-heartbeat-secs" => {
                 index += 1;
@@ -2018,6 +2165,41 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
                     .parse::<usize>()
                     .map_err(|error| format!("invalid max peers: {error}"))?
                     .max(1);
+            }
+            "--min-relay-fee" => {
+                index += 1;
+                config.min_relay_fee = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --min-relay-fee".to_string())?
+                    .parse::<u32>()
+                    .map_err(|error| format!("invalid min relay fee: {error}"))?
+                    .max(runtime::params::MIN_RELAY_FEE_FLOOR);
+            }
+            "--market-fee" => {
+                index += 1;
+                config.market_fee = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --market-fee".to_string())?
+                    .parse::<u32>()
+                    .map_err(|error| format!("invalid market fee: {error}"))?;
+            }
+            "--low-fee-expiry-secs" => {
+                index += 1;
+                let secs = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --low-fee-expiry-secs".to_string())?
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid low fee expiry: {error}"))?;
+                config.low_fee_expiry = Duration::from_secs(secs.max(1));
+            }
+            "--mempool-expiry-secs" => {
+                index += 1;
+                let secs = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --mempool-expiry-secs".to_string())?
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid mempool expiry: {error}"))?;
+                config.mempool_expiry = Duration::from_secs(secs.max(1));
             }
             "--miner" => {
                 index += 1;
@@ -2062,7 +2244,23 @@ fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
         index += 1;
     }
 
+    dedupe_socket_addrs(&mut config.listen_addrs);
+    dedupe_socket_addrs(&mut config.public_addrs);
+    normalize_mempool_policy(&mut config);
     Ok(config)
+}
+
+fn dedupe_socket_addrs(addrs: &mut Vec<SocketAddr>) {
+    let mut seen = HashSet::new();
+    addrs.retain(|addr| seen.insert(*addr));
+}
+
+fn format_socket_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn config_path_arg(args: &[String]) -> Option<&str> {
@@ -2093,10 +2291,15 @@ fn load_run_config_file_if_exists(path: &str) -> Result<Option<RunConfigFile>, S
 
 fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<(), String> {
     config.db_path = file.db_path;
-    config.listen_addr = file
+    config.listen_addrs = file
         .listen_addr
-        .parse()
-        .map_err(|error| format!("invalid listen_addr in config: {error}"))?;
+        .into_vec()
+        .into_iter()
+        .map(|addr| {
+            addr.parse()
+                .map_err(|error| format!("invalid listen_addr `{addr}` in config: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     config.rpc_addr = file
         .rpc_addr
         .parse()
@@ -2111,16 +2314,30 @@ fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<
         .collect::<Result<Vec<_>, _>>()?;
     config.peers_file = file.peers_file;
     config.gateway_url = file.gateway_url;
-    config.public_addr = file
+    config.public_addrs = file
         .public_addr
+        .map(OneOrMany::into_vec)
+        .unwrap_or_default()
+        .into_iter()
         .map(|addr| {
             addr.parse()
-                .map_err(|error| format!("invalid public_addr in config: {error}"))
+                .map_err(|error| format!("invalid public_addr `{addr}` in config: {error}"))
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
     config.gateway_heartbeat = Duration::from_secs(file.gateway_heartbeat_secs.max(1));
     config.shutdown_file = file.shutdown_file;
     config.max_peers = file.max_peers.max(1);
+    config.min_relay_fee = file
+        .min_relay_fee
+        .unwrap_or(config.min_relay_fee)
+        .max(runtime::params::MIN_RELAY_FEE_FLOOR);
+    config.market_fee = file.market_fee.unwrap_or(config.market_fee);
+    if let Some(secs) = file.low_fee_expiry_secs {
+        config.low_fee_expiry = Duration::from_secs(secs.max(1));
+    }
+    if let Some(secs) = file.mempool_expiry_secs {
+        config.mempool_expiry = Duration::from_secs(secs.max(1));
+    }
     config.mine = file.mine;
     config.mine_interval = Duration::from_secs(file.mine_interval_secs);
     config.mine_attempts = file.mine_attempts;
@@ -2136,6 +2353,16 @@ fn apply_run_config_file(config: &mut RunConfig, file: RunConfigFile) -> Result<
     }
 
     Ok(())
+}
+
+fn normalize_mempool_policy(config: &mut RunConfig) {
+    config.min_relay_fee = config
+        .min_relay_fee
+        .max(runtime::params::MIN_RELAY_FEE_FLOOR);
+    config.market_fee = config.market_fee.max(config.min_relay_fee);
+    if config.low_fee_expiry > config.mempool_expiry {
+        config.low_fee_expiry = config.mempool_expiry;
+    }
 }
 
 fn apply_wallet_file(config: &mut RunConfig, path: Option<&String>) -> Result<(), String> {
@@ -2181,6 +2408,9 @@ fn mine_once_unlocked(
             .map_err(|_| "node state lock poisoned".to_string())?;
         node.mempool.prune_expired(timestamp);
         let difficulty = node.next_difficulty().map_err(|error| error.to_string())?;
+        let mempool_len = node.mempool.len();
+        println!("target::argon2 |difficulty::{}|", difficulty);
+        println!("mempool:: |txs::{}|", mempool_len);
         let candidate = prepare_candidate_block(
             &node.mempool,
             &node.ledger,
@@ -2228,12 +2458,13 @@ fn mine_once_unlocked(
     node.flush_to_storage()
         .map_err(|error| format!("failed to flush mined block: {error}"))?;
     println!(
-        "mined:: |height::{}|hash::{}|difficulty::{}|txs::{}|attempts::{}|",
+        "mined:: |height::{}|hash::{}|difficulty::{}|txs::{}|attempts::{}|timestamp::{}|",
         result.block.height().0,
         short_hash(Some(result.block.hash())),
         result.block.difficulty(),
         result.block.transactions.len(),
-        result.attempts
+        result.attempts,
+        result.block.timestamp()
     );
     Ok(Some(result.block))
 }
@@ -2346,7 +2577,7 @@ Usage:
   paqus node libp2p-info
   paqus node config [config-path]
   paqus node init [db-path] [miner-address-hex]
-  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
+  paqus node run [db-path] [--config path] [--listen addr] [--rpc-listen addr] [--peer addr] [--peers-file path] [--gateway host:port] [--public-addr host:port] [--min-relay-fee units] [--market-fee units] [--low-fee-expiry-secs n] [--mempool-expiry-secs n] [--wallet path] [--miner address-hex] [--miner-secret-key key-hex] [--mine]
   paqus wallet new [wallet-path] [--show-secret]
   paqus wallet address <secret-key-hex>
   paqus wallet balance <address-hex> [db-path]

@@ -2239,7 +2239,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "paqus"
-version = "0.1.7"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "131ae5c6caee4ab8a73634cf5d32366bc3bf548399f2d421c3fc8c43dafca050"
 dependencies = [
  "argon2",
  "borsh",
@@ -2252,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "paqus-node"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "axum",
  "borsh",
@@ -2262,6 +2264,7 @@ dependencies = [
  "paqus",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
  "tracing-subscriber",

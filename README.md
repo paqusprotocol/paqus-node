@@ -15,7 +15,7 @@ cargo run -- node run ./data/paqus --wallet wallet.json
 Check the node from another terminal:
 
 ```bash
-curl http://127.0.0.1:9933/status
+curl http://127.0.0.1:6666/status
 ```
 
 Run with mining:
@@ -102,6 +102,10 @@ Useful `wallet send` options:
 --rpc <host:port>
 ```
 
+The sender chooses the transaction fee with `--fee`. The node may reject or
+expire transactions from its mempool based on local relay policy, but a low fee
+does not make an otherwise valid transaction invalid by consensus.
+
 Advanced form for printing signed transaction hex without broadcasting:
 
 ```bash
@@ -142,8 +146,9 @@ Run with explicit addresses:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen '[::]:30333' \
-  --rpc-listen 127.0.0.1:9933 \
+  --listen 0.0.0.0:5555 \
+  --listen '[::]:5555' \
+  --rpc-listen 127.0.0.1:6666 \
   --wallet wallet.json
 ```
 
@@ -161,65 +166,47 @@ Common `node run` options:
 --miner-secret-key <secret-key-hex>
 ```
 
-## Gateway And Peers
+`--listen` and `--public-addr` can be repeated. Use one IPv4 address and one
+IPv6 address when the node should accept and announce both address families.
 
-Paqus nodes can discover peers in three ways:
+## Peers
+
+Paqus nodes do not need a gateway for a small network. Start with one known
+peer, then let the node save and reuse the peer cache:
 
 - `--peer <host:port>` manually connects to a known node.
-- `--gateway <host:port>` uses a discovery gateway as an optional bootstrap.
-- `./data/paqus/peers.json` stores peers learned through peer gossip.
+- `./data/paqus/peers.json` stores manual and learned peers.
+- `--gateway <host:port>` is optional bootstrap only, for later/public networks.
 
 For IPv6 socket addresses, wrap the IP in brackets:
 
 ```text
-[2001:db8::10]:30333
+[2001:db8::10]:5555
 ```
 
-Run a public node that registers itself with a gateway:
+Run a public node without a gateway:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen '[::]:30333' \
-  --rpc-listen 127.0.0.1:9933 \
-  --gateway '[GATEWAY_IPV6]:8080' \
-  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
+  --listen 0.0.0.0:5555 \
+  --listen '[::]:5555' \
+  --rpc-listen 127.0.0.1:6666 \
+  --public-addr 182.253.xxx.xxx:5555 \
+  --public-addr '[YOUR_PUBLIC_IPV6]:5555' \
   --wallet wallet.json \
   --mine
 ```
 
-`--listen` is the local bind address. `[::]:30333` listens on all IPv6
-interfaces and is usually enough. `--public-addr` is the reachable address that
-the node announces to the gateway and peers, so it must use your public IP or
-DNS name and the P2P port `30333`.
-
-Run the gateway service from the sibling crate:
-
-```bash
-cd ../paqus-gateway
-cargo run -- \
-  --listen '[::]:8080' \
-  --node-rpc 127.0.0.1:9933 \
-  --allow-private-peers
-```
-
-Join through a gateway:
-
-```bash
-cargo run -- node run ./data/paqus \
-  --listen '[::]:30333' \
-  --rpc-listen 127.0.0.1:9933 \
-  --gateway '[GATEWAY_IPV6]:8080' \
-  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
-  --wallet wallet.json \
-  --mine \
-  --mine-attempts 10000
-```
+`--listen` is the local bind address. `0.0.0.0:5555` listens on all IPv4
+interfaces, and `[::]:5555` listens on all IPv6 interfaces. `--public-addr` is
+the reachable address that the node announces to peers, so it must use your
+public IPv4/IPv6 address or DNS name and the P2P port `5555`.
 
 Join with a manual peer:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --peer '[PEER_HOST]:30333' \
+  --peer '[PEER_HOST]:5555' \
   --wallet wallet.json
 ```
 
@@ -227,31 +214,42 @@ Run without a gateway after `peers.json` is populated:
 
 ```bash
 cargo run -- node run ./data/paqus \
-  --listen '[::]:30333' \
-  --rpc-listen 127.0.0.1:9933 \
-  --public-addr '[YOUR_PUBLIC_IPV6]:30333' \
+  --listen 0.0.0.0:5555 \
+  --listen '[::]:5555' \
+  --rpc-listen 127.0.0.1:6666 \
+  --public-addr 182.253.xxx.xxx:5555 \
+  --public-addr '[YOUR_PUBLIC_IPV6]:5555' \
   --wallet wallet.json \
   --mine
 ```
 
-Nodes exchange peer lists over the P2P protocol. After a node discovers peers
-from a gateway or manual `--peer`, it caches them in `./data/paqus/peers.json`
-by default:
+Nodes exchange peer lists over the P2P protocol. After a node starts with a
+manual `--peer` or learns peers from another node, it caches them in
+`./data/paqus/peers.json` by default:
 
 ```json
 {
   "peers": [
-    "[2001:db8::20]:30333"
+    "[2001:db8::20]:5555"
   ]
 }
 ```
 
 On the next startup, the node loads this cache, reconnects to known peers, and
 asks them for more peers. Use `--peers-file <path>` to choose another cache
-path. A gateway is only needed for first-time bootstrap or as a fallback when
-the local peer cache is empty or stale.
+path.
+
+Gateway discovery is still available with `--gateway <host:port>`, but it is
+off by default and not required while the network is still operated with known
+manual peers.
 
 ## Mining
+
+When `--mine` is used together with `--peer` or `--gateway`, mining is gated by
+network sync. The node must complete at least one successful peer handshake, must
+not see a peer with a higher tip, and must have no pending sync/orphan work
+before it can produce a block. While waiting, logs show reasons such as
+`handshake_pending`, `peer_ahead`, or `sync_pending`.
 
 Mining uses the current node timestamp when preparing candidate blocks. Blocks
 are validated against parent timestamp, local future-time tolerance, proof of
@@ -260,27 +258,53 @@ work, state root, coinbase, checkpoint policy, and transaction validity.
 If mining is skipped because the mempool is empty, submit a transaction through
 RPC or connect to peers where transactions are flowing.
 
+## Mempool Fee Policy
+
+Default relay policy:
+
+```text
+min_relay_fee = 1
+market_fee = 2
+low_fee_expiry_secs = 1800
+mempool_expiry_secs = 86400
+```
+
+Transactions with fee below `min_relay_fee` are rejected by this node. The
+effective floor is always at least `1`, so fee `0` is not relayed. Transactions
+with fee below `market_fee` can stay pending for up to `low_fee_expiry_secs`
+(30 minutes by default). Transactions at or above `market_fee` can stay pending
+for up to `mempool_expiry_secs` (1 day by default).
+
+Operators can tune the policy without changing consensus:
+
+```text
+--min-relay-fee <units>
+--market-fee <units>
+--low-fee-expiry-secs <seconds>
+--mempool-expiry-secs <seconds>
+```
+
 ## RPC
 
 ```bash
-curl http://127.0.0.1:9933/health
-curl http://127.0.0.1:9933/status
-curl http://127.0.0.1:9933/peers
-curl http://127.0.0.1:9933/chain
-curl http://127.0.0.1:9933/balance/<address-hex>
-curl http://127.0.0.1:9933/blocks/latest
-curl http://127.0.0.1:9933/blocks/<height>
-curl http://127.0.0.1:9933/blocks/hash/<block-hash>
-curl http://127.0.0.1:9933/tx/<tx-hash>
-curl http://127.0.0.1:9933/address/<address-hex>
-curl http://127.0.0.1:9933/accounts
-curl http://127.0.0.1:9933/mempool
+curl http://127.0.0.1:6666/health
+curl http://127.0.0.1:6666/status
+curl http://127.0.0.1:6666/peers
+curl http://127.0.0.1:6666/chain
+curl http://127.0.0.1:6666/balance/<address-hex>
+curl http://127.0.0.1:6666/blocks/latest
+curl http://127.0.0.1:6666/blocks/<height>
+curl http://127.0.0.1:6666/blocks/hash/<block-hash>
+curl http://127.0.0.1:6666/tx/<tx-hash>
+curl http://127.0.0.1:6666/address/<address-hex>
+curl http://127.0.0.1:6666/accounts
+curl http://127.0.0.1:6666/mempool
 ```
 
 Submit signed transaction hex:
 
 ```bash
-curl -X POST http://127.0.0.1:9933/tx \
+curl -X POST http://127.0.0.1:6666/tx \
   -H 'content-type: application/json' \
   -d '{"tx":"<signed-transaction-hex>"}'
 ```

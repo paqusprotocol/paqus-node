@@ -55,8 +55,8 @@ impl PeerState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerPoll {
-    Idle,
-    Synced,
+    Idle { remote_tip: Height },
+    Synced { remote_tip: Height },
 }
 
 pub fn load_peers_file(path: &str) -> Result<Vec<SocketAddr>, String> {
@@ -120,9 +120,9 @@ pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, 
         .0;
     if tip.0 <= local_height {
         return if request_missing_parent_blocks(peer, node)? {
-            Ok(PeerPoll::Synced)
+            Ok(PeerPoll::Synced { remote_tip: tip })
         } else {
-            Ok(PeerPoll::Idle)
+            Ok(PeerPoll::Idle { remote_tip: tip })
         };
     }
 
@@ -131,7 +131,7 @@ pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, 
         request_block(peer, node, Height(height))?;
     }
     request_missing_parent_blocks(peer, node)?;
-    Ok(PeerPoll::Synced)
+    Ok(PeerPoll::Synced { remote_tip: tip })
 }
 
 pub fn request_peers(peer: SocketAddr) -> Result<Vec<PeerInfo>, String> {

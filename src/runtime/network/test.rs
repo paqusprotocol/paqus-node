@@ -60,7 +60,7 @@ fn roundtrips_tip_and_block_messages() {
 #[test]
 fn roundtrips_peer_list() {
     let envelope = NetworkMessage::Peers(vec![PeerInfo {
-        address: "127.0.0.1:30333".to_string(),
+        address: "127.0.0.1:5555".to_string(),
     }])
     .to_envelope();
 
@@ -245,7 +245,7 @@ fn handler_submits_transaction_to_node_mempool() {
 fn peer_sends_and_receives_messages() {
     let stream = MemoryStream::default();
     let info = PeerInfo {
-        address: "127.0.0.1:30333".to_string(),
+        address: "127.0.0.1:5555".to_string(),
     };
     let mut peer = Peer::new(stream, info.clone());
 
