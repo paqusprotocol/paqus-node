@@ -1,14 +1,15 @@
-use crate::network::roundtrip;
+use crate::network::{configure_stream, connect_peer, request_on_stream};
 use crate::paquscore::{BlockHash, Height, NetworkMessage, Node, PeerInfo, TipInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+pub const PERSISTENT_PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_RETRY_BASE: Duration = Duration::from_secs(2);
 const PEER_RETRY_MAX: Duration = Duration::from_secs(60);
 const MAX_BLOCKS_PER_SYNC: u64 = 64;
@@ -57,6 +58,32 @@ impl PeerState {
 pub enum PeerPoll {
     Idle { remote_tip: Height },
     Synced { remote_tip: Height },
+}
+
+pub struct PeerConnection {
+    addr: SocketAddr,
+    stream: TcpStream,
+}
+
+impl PeerConnection {
+    pub fn connect(addr: SocketAddr) -> Result<Self, String> {
+        let stream = connect_peer(addr)?;
+        configure_stream(&stream, PERSISTENT_PEER_TIMEOUT)?;
+        Ok(Self { addr, stream })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn request(&mut self, message: NetworkMessage) -> Result<NetworkMessage, String> {
+        request_on_stream(&mut self.stream, message)
+    }
+
+    pub fn send(&mut self, message: NetworkMessage) -> Result<(), String> {
+        crate::paquscore::write_message(&mut self.stream, &message.to_envelope())
+            .map_err(|error| format!("send failed: {error}"))
+    }
 }
 
 pub fn load_peers_file(path: &str) -> Result<Vec<SocketAddr>, String> {
@@ -110,6 +137,14 @@ pub fn dedupe_peers(peers: &mut Vec<SocketAddr>) {
 }
 
 pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, String> {
+    let mut peer = PeerConnection::connect(peer)?;
+    poll_peer_connection(&mut peer, node)
+}
+
+pub fn poll_peer_connection(
+    peer: &mut PeerConnection,
+    node: &Arc<Mutex<Node>>,
+) -> Result<PeerPoll, String> {
     handshake_peer(peer, node)?;
     let tip = request_tip(peer)?;
     let local_height = node
@@ -134,14 +169,14 @@ pub fn poll_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<PeerPoll, 
     Ok(PeerPoll::Synced { remote_tip: tip })
 }
 
-pub fn request_peers(peer: SocketAddr) -> Result<Vec<PeerInfo>, String> {
-    match roundtrip(peer, NetworkMessage::GetPeers)? {
+pub fn request_peers_connection(peer: &mut PeerConnection) -> Result<Vec<PeerInfo>, String> {
+    match peer.request(NetworkMessage::GetPeers)? {
         NetworkMessage::Peers(peers) => Ok(peers),
         _ => Err("peer returned unexpected peers response".to_string()),
     }
 }
 
-fn handshake_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<(), String> {
+fn handshake_peer(peer: &mut PeerConnection, node: &Arc<Mutex<Node>>) -> Result<(), String> {
     let tip = {
         let node = node
             .lock()
@@ -151,7 +186,7 @@ fn handshake_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<(), Strin
             .map(|(height, hash)| TipInfo { height, hash })
     };
     let version = VersionInfo::local(tip);
-    match roundtrip(peer, NetworkMessage::Version(version))? {
+    match peer.request(NetworkMessage::Version(version))? {
         NetworkMessage::VerAck(remote) => remote
             .validate_compatibility()
             .map_err(|reason| format!("peer returned incompatible version: {reason:?}")),
@@ -162,29 +197,38 @@ fn handshake_peer(peer: SocketAddr, node: &Arc<Mutex<Node>>) -> Result<(), Strin
     }
 }
 
-fn request_tip(peer: SocketAddr) -> Result<Height, String> {
-    match roundtrip(peer, NetworkMessage::GetTip)? {
+fn request_tip(peer: &mut PeerConnection) -> Result<Height, String> {
+    match peer.request(NetworkMessage::GetTip)? {
         NetworkMessage::Tip(tip) => Ok(tip.height),
         _ => Err("peer returned unexpected tip response".to_string()),
     }
 }
 
-fn request_block(peer: SocketAddr, node: &Arc<Mutex<Node>>, height: Height) -> Result<(), String> {
-    let response = roundtrip(peer, NetworkMessage::GetBlockByHeight { height })?;
+fn request_block(
+    peer: &mut PeerConnection,
+    node: &Arc<Mutex<Node>>,
+    height: Height,
+) -> Result<(), String> {
+    let response = peer.request(NetworkMessage::GetBlockByHeight { height })?;
     let NetworkMessage::Block(block) = response else {
         return Err(format!("peer did not return block at height {}", height.0));
     };
     let mut node = node
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?;
-    node.apply_block(block)
-        .map_err(|error| format!("failed to apply block {} from {peer}: {error}", height.0))?;
+    node.apply_block(block).map_err(|error| {
+        format!(
+            "failed to apply block {} from {}: {error}",
+            height.0,
+            peer.addr()
+        )
+    })?;
     node.flush_to_storage()
         .map_err(|error| format!("failed to flush synced block: {error}"))?;
     println!(
         "synced block height {} from {} |tip::{}|",
         height.0,
-        peer,
+        peer.addr(),
         node.tip_hash()
             .map(|hash| hex::encode(hash.0))
             .unwrap_or_else(|| "none".to_string())
@@ -193,7 +237,7 @@ fn request_block(peer: SocketAddr, node: &Arc<Mutex<Node>>, height: Height) -> R
 }
 
 fn request_missing_parent_blocks(
-    peer: SocketAddr,
+    peer: &mut PeerConnection,
     node: &Arc<Mutex<Node>>,
 ) -> Result<bool, String> {
     let mut requested = false;
@@ -214,11 +258,11 @@ fn request_missing_parent_blocks(
 }
 
 fn request_block_by_hash(
-    peer: SocketAddr,
+    peer: &mut PeerConnection,
     node: &Arc<Mutex<Node>>,
     hash: BlockHash,
 ) -> Result<(), String> {
-    let response = roundtrip(peer, NetworkMessage::GetBlockByHash { hash })?;
+    let response = peer.request(NetworkMessage::GetBlockByHash { hash })?;
     let NetworkMessage::Block(block) = response else {
         return Err(format!(
             "peer did not return block hash {}",
@@ -228,14 +272,18 @@ fn request_block_by_hash(
     let mut node = node
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?;
-    node.apply_block(block)
-        .map_err(|error| format!("failed to apply missing parent from {peer}: {error}"))?;
+    node.apply_block(block).map_err(|error| {
+        format!(
+            "failed to apply missing parent from {}: {error}",
+            peer.addr()
+        )
+    })?;
     node.flush_to_storage()
         .map_err(|error| format!("failed to flush missing parent block: {error}"))?;
     println!(
         "synced missing parent {} from {} |tip::{}|",
         hex::encode(hash.0),
-        peer,
+        peer.addr(),
         node.tip_hash()
             .map(|hash| hex::encode(hash.0))
             .unwrap_or_else(|| "none".to_string())

@@ -43,23 +43,22 @@ pub fn configure_stream(stream: &TcpStream, timeout: Duration) -> Result<(), Str
     Ok(())
 }
 
-pub fn roundtrip(peer: SocketAddr, message: NetworkMessage) -> Result<NetworkMessage, String> {
-    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
+pub fn connect_peer(peer: SocketAddr) -> Result<TcpStream, String> {
+    let stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
         .map_err(|error| format!("connect failed: {error}"))?;
     configure_stream(&stream, Duration::from_secs(5))?;
-    write_message(&mut stream, &message.to_envelope())
-        .map_err(|error| format!("send failed: {error}"))?;
-    read_message(&mut stream)
-        .map(|envelope| envelope.message)
-        .map_err(|error| format!("read failed: {error}"))
+    Ok(stream)
 }
 
-pub fn send_message(peer: SocketAddr, message: NetworkMessage) -> Result<(), String> {
-    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
-        .map_err(|error| format!("connect failed: {error}"))?;
-    configure_stream(&stream, Duration::from_secs(5))?;
-    write_message(&mut stream, &message.to_envelope())
-        .map_err(|error| format!("send failed: {error}"))
+pub fn request_on_stream(
+    stream: &mut TcpStream,
+    message: NetworkMessage,
+) -> Result<NetworkMessage, String> {
+    write_message(stream, &message.to_envelope())
+        .map_err(|error| format!("send failed: {error}"))?;
+    read_message(stream)
+        .map(|envelope| envelope.message)
+        .map_err(|error| format!("read failed: {error}"))
 }
 
 pub fn http_post_json(addr: &str, path: &str, body: &str) -> Result<String, String> {

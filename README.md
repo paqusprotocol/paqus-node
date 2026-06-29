@@ -1,15 +1,15 @@
 # Paqus Node
 
 Rust full node for the Paqus testnet. It handles LMDB chain storage, mining,
-RPC, peer sync, gateway discovery, mempool validation, transaction indexing, and
-wallet commands.
+RPC, peer sync, gateway discovery, mempool validation, and transaction indexing.
 
 ## Quick Start
 
 ```bash
-cargo run -- wallet new wallet.json
+cd ../paqus-wallet && cargo run -- new wallet.json
+cd ../paqus-node
 cargo run -- node init ./data/paqus
-cargo run -- node run ./data/paqus --wallet wallet.json
+cargo run -- node run ./data/paqus --wallet ../paqus-wallet/wallet.json
 ```
 
 Check the node from another terminal:
@@ -21,7 +21,7 @@ curl http://127.0.0.1:6666/status
 Run with mining:
 
 ```bash
-cargo run -- node run ./data/paqus --wallet wallet.json --mine
+cargo run -- node run ./data/paqus --wallet ../paqus-wallet/wallet.json --mine
 ```
 
 Stop the default node:
@@ -63,34 +63,37 @@ cargo run -- menu
 
 ## Wallet
 
+Wallet CLI lives in `../paqus-wallet`.
+
 Create a wallet:
 
 ```bash
-cargo run -- wallet new wallet.json
+cd ../paqus-wallet
+cargo run -- new wallet.json
 ```
 
 Print the secret key too:
 
 ```bash
-cargo run -- wallet new wallet.json --show-secret
+cargo run -- new wallet.json --show-secret
 ```
 
 Derive address from a secret key:
 
 ```bash
-cargo run -- wallet address <secret-key-hex>
+cargo run -- address <secret-key-hex>
 ```
 
 Check balance:
 
 ```bash
-cargo run -- wallet balance <address-hex> [db-path]
+cargo run -- balance <address-hex> --rpc 127.0.0.1:6666
 ```
 
 Send a transaction:
 
 ```bash
-cargo run -- wallet send <recipient-address-hex> 10
+cargo run -- send <recipient-address-hex> 10 --wallet wallet.json
 ```
 
 Useful `wallet send` options:
@@ -109,13 +112,13 @@ does not make an otherwise valid transaction invalid by consensus.
 Advanced form for printing signed transaction hex without broadcasting:
 
 ```bash
-cargo run -- wallet send --wallet wallet.json --to <recipient-address-hex> --amount 10
+cargo run -- send --wallet wallet.json --to <recipient-address-hex> --amount 10
 ```
 
 Broadcast the advanced form to the node RPC with `--submit`:
 
 ```bash
-cargo run -- wallet send \
+cargo run -- send \
   --wallet wallet.json \
   --to <recipient-address-hex> \
   --amount 10 \
@@ -238,6 +241,11 @@ manual `--peer` or learns peers from another node, it caches them in
 On the next startup, the node loads this cache, reconnects to known peers, and
 asks them for more peers. Use `--peers-file <path>` to choose another cache
 path.
+
+Peer sync keeps one outbound TCP connection open per known peer and reuses it
+for version handshake, tip checks, peer discovery, and block requests. Inbound
+connections can also serve multiple messages before closing, so normal peer sync
+does not create a new TCP connection for every individual request.
 
 Gateway discovery is still available with `--gateway <host:port>`, but it is
 off by default and not required while the network is still operated with known

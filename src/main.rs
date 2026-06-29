@@ -18,9 +18,10 @@ use borsh::BorshDeserialize;
 use gateway::{heartbeat_peer, register_peer, request_gateway_peers};
 use gossip::{BroadcastReport, broadcast_to_peers};
 use mempool::resolve_wallet_nonce;
-use network::{bind_nonblocking, configure_stream, http_get, http_post_json, send_message};
+use network::{bind_nonblocking, configure_stream, http_get, http_post_json};
 use p2p::{
-    PeerPoll, PeerState, dedupe_peers, load_peers_file, poll_peer, request_peers, save_peers_file,
+    PERSISTENT_PEER_TIMEOUT, PeerConnection, PeerPoll, PeerState, dedupe_peers, load_peers_file,
+    poll_peer, poll_peer_connection, request_peers_connection, save_peers_file,
 };
 use paquscore::{
     Address, Amount, Block, BlockHash, Consensus, GENESIS_PREMINE_ADDRESS, Hash, Height,
@@ -35,6 +36,7 @@ use paquscore::{
 };
 use runtime::mempool::MempoolConfig;
 use runtime::miner::{MiningConfig, mine_prepared_block, prepare_candidate_block};
+use runtime::network::NetworkError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::env;
@@ -681,6 +683,7 @@ struct SubmitTxRequest {
 struct RpcState {
     node: Arc<Mutex<Node>>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    peer_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     mining: bool,
     log_counters: Arc<LogCounters>,
 }
@@ -879,6 +882,7 @@ struct NodeService {
     config: RunConfig,
     listeners: Vec<TcpListener>,
     peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    peer_connections: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     log_counters: Arc<LogCounters>,
     requires_peer_sync_before_mining: bool,
     last_mine: Instant,
@@ -921,6 +925,7 @@ impl NodeService {
             config,
             listeners,
             peers: Arc::new(Mutex::new(peers)),
+            peer_connections: Arc::new(Mutex::new(HashMap::new())),
             log_counters,
             requires_peer_sync_before_mining,
             last_mine: Instant::now(),
@@ -1213,7 +1218,29 @@ impl NodeService {
                         accepted = true;
                         self.set_activity(NodeActivity::ServingPeers)?;
                         println!("p2p inbound:: |peer::{}|event::accepted|", peer);
-                        self.handle_p2p_stream(stream, peer)?;
+                        let node = self.node.clone();
+                        let peers = self.peers.clone();
+                        let public_addrs = self.config.public_addrs.clone();
+                        let listen_addrs = self.config.listen_addrs.clone();
+                        let max_peers = self.config.max_peers;
+                        let peers_file = self.config.peers_file.clone();
+                        thread::Builder::new()
+                            .name(format!("paqus-p2p-{peer}"))
+                            .spawn(move || {
+                                if let Err(error) = Self::handle_p2p_stream_task(
+                                    stream,
+                                    peer,
+                                    node,
+                                    peers,
+                                    public_addrs,
+                                    listen_addrs,
+                                    max_peers,
+                                    peers_file,
+                                ) {
+                                    eprintln!("p2p inbound {peer} failed: {error}");
+                                }
+                            })
+                            .map_err(|error| format!("failed to spawn p2p handler: {error}"))?;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(format!("failed to accept peer: {error}")),
@@ -1225,39 +1252,63 @@ impl NodeService {
         }
     }
 
-    fn handle_p2p_stream(&mut self, mut stream: TcpStream, peer: SocketAddr) -> Result<(), String> {
-        configure_stream(&stream, Duration::from_secs(5))?;
-        match read_message(&mut stream) {
-            Ok(envelope) => {
-                let response = match envelope.message {
-                    NetworkMessage::GetPeers => Some(NetworkMessage::Peers(self.peer_infos())),
-                    NetworkMessage::Peers(peers) => {
-                        if self.add_peer_infos(peers) {
-                            let _ = self.save_peers();
+    fn handle_p2p_stream_task(
+        mut stream: TcpStream,
+        peer: SocketAddr,
+        node: Arc<Mutex<Node>>,
+        peers: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+        public_addrs: Vec<SocketAddr>,
+        listen_addrs: Vec<SocketAddr>,
+        max_peers: usize,
+        peers_file: Option<String>,
+    ) -> Result<(), String> {
+        configure_stream(&stream, PERSISTENT_PEER_TIMEOUT)?;
+        loop {
+            match read_message(&mut stream) {
+                Ok(envelope) => {
+                    let response = match envelope.message {
+                        NetworkMessage::GetPeers => Some(NetworkMessage::Peers(
+                            Self::peer_infos_from(&peers, &public_addrs),
+                        )),
+                        NetworkMessage::Peers(peer_infos) => {
+                            if Self::add_peer_infos_to(
+                                &peers,
+                                peer_infos,
+                                &public_addrs,
+                                &listen_addrs,
+                                max_peers,
+                            ) {
+                                let _ = Self::save_peers_from(&peers_file, &peers);
+                            }
+                            None
                         }
-                        None
-                    }
-                    message => {
-                        let inbound_log = inbound_message_log(&message, peer);
-                        let mut node = self
-                            .node
-                            .lock()
-                            .map_err(|_| "node state lock poisoned".to_string())?;
-                        let response = handle_message(&mut node, message).map_err(|error| {
-                            format!("failed to handle message from {peer}: {error}")
-                        })?;
-                        if let Some(log) = inbound_log {
-                            println!("{log}");
+                        message => {
+                            let inbound_log = inbound_message_log(&message, peer);
+                            let mut node = node
+                                .lock()
+                                .map_err(|_| "node state lock poisoned".to_string())?;
+                            let response = handle_message(&mut node, message).map_err(|error| {
+                                format!("failed to handle message from {peer}: {error}")
+                            })?;
+                            if let Some(log) = inbound_log {
+                                println!("{log}");
+                            }
+                            response
                         }
-                        response
+                    };
+                    if let Some(response) = response {
+                        write_message(&mut stream, &response.to_envelope())
+                            .map_err(|error| format!("failed to respond to {peer}: {error}"))?;
                     }
-                };
-                if let Some(response) = response {
-                    write_message(&mut stream, &response.to_envelope())
-                        .map_err(|error| format!("failed to respond to {peer}: {error}"))?;
+                }
+                Err(error) if is_peer_stream_closed(&error) => {
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("peer {peer} sent invalid message: {error}");
+                    break;
                 }
             }
-            Err(error) => eprintln!("peer {peer} sent invalid message: {error}"),
         }
         Ok(())
     }
@@ -1275,7 +1326,7 @@ impl NodeService {
         };
 
         for peer in due_peers {
-            let result = poll_peer(peer, &self.node);
+            let result = self.poll_persistent_peer(peer);
             match result {
                 Ok(PeerPoll::Idle { remote_tip }) | Ok(PeerPoll::Synced { remote_tip }) => {
                     if let Ok(mut peers) = self.peers.lock() {
@@ -1283,7 +1334,16 @@ impl NodeService {
                             state.mark_ok(Some(remote_tip));
                         }
                     }
-                    if let Ok(infos) = request_peers(peer) {
+                    let infos = match self.peer_connections.lock() {
+                        Ok(mut connections) => connections
+                            .get_mut(&peer)
+                            .and_then(|connection| request_peers_connection(connection).ok()),
+                        Err(_) => {
+                            eprintln!("peer connection lock poisoned");
+                            None
+                        }
+                    };
+                    if let Some(infos) = infos {
                         if self.add_peer_infos(infos) {
                             let _ = self.save_peers();
                         }
@@ -1301,11 +1361,17 @@ impl NodeService {
                         }
                     }
                     if dropped {
+                        if let Ok(mut connections) = self.peer_connections.lock() {
+                            connections.remove(&peer);
+                        }
                         let _ = self.save_peers();
                         eprintln!(
                             "peer {peer} sync failed {MAX_PEER_FAILURES} times; dropped: {error}"
                         );
                     } else {
+                        if let Ok(mut connections) = self.peer_connections.lock() {
+                            connections.remove(&peer);
+                        }
                         eprintln!("peer {peer} sync failed: {error}");
                     }
                 }
@@ -1313,22 +1379,53 @@ impl NodeService {
         }
     }
 
+    fn poll_persistent_peer(&mut self, peer: SocketAddr) -> Result<PeerPoll, String> {
+        let mut connections = self
+            .peer_connections
+            .lock()
+            .map_err(|_| "peer connection lock poisoned".to_string())?;
+        if let Entry::Vacant(entry) = connections.entry(peer) {
+            let connection = PeerConnection::connect(peer)?;
+            println!("p2p outbound:: |peer::{peer}|event::connected|");
+            entry.insert(connection);
+        }
+        let connection = connections
+            .get_mut(&peer)
+            .ok_or_else(|| format!("missing peer connection for {peer}"))?;
+        poll_peer_connection(connection, &self.node)
+    }
+
     fn add_peer_infos(&mut self, peers: Vec<PeerInfo>) -> bool {
-        let Ok(mut current) = self.peers.lock() else {
+        Self::add_peer_infos_to(
+            &self.peers,
+            peers,
+            &self.config.public_addrs,
+            &self.config.listen_addrs,
+            self.config.max_peers,
+        )
+    }
+
+    fn add_peer_infos_to(
+        peers_state: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+        peers: Vec<PeerInfo>,
+        public_addrs: &[SocketAddr],
+        listen_addrs: &[SocketAddr],
+        max_peers: usize,
+    ) -> bool {
+        let Ok(mut current) = peers_state.lock() else {
             eprintln!("peer state lock poisoned");
             return false;
         };
         let known = current.keys().copied().collect::<HashSet<_>>();
         let mut changed = false;
         for info in peers {
-            if current.len() >= self.config.max_peers {
+            if current.len() >= max_peers {
                 break;
             }
             let Ok(addr) = info.address.parse::<SocketAddr>() else {
                 continue;
             };
-            if self.config.public_addrs.contains(&addr) || self.config.listen_addrs.contains(&addr)
-            {
+            if public_addrs.contains(&addr) || listen_addrs.contains(&addr) {
                 continue;
             }
             if known.contains(&addr) {
@@ -1408,15 +1505,21 @@ impl NodeService {
     }
 
     fn save_peers(&self) -> Result<(), String> {
-        let Some(path) = &self.config.peers_file else {
+        Self::save_peers_from(&self.config.peers_file, &self.peers)
+    }
+
+    fn save_peers_from(
+        peers_file: &Option<String>,
+        peers_state: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    ) -> Result<(), String> {
+        let Some(path) = peers_file else {
             return Ok(());
         };
         if let Some(parent) = std::path::Path::new(path).parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create peers file parent: {error}"))?;
         }
-        let peers = self
-            .peers
+        let peers = peers_state
             .lock()
             .map_err(|_| "peer state lock poisoned".to_string())?;
         let mut peers = peers.keys().copied().collect::<Vec<_>>();
@@ -1424,8 +1527,11 @@ impl NodeService {
         save_peers_file(path, peers)
     }
 
-    fn peer_infos(&self) -> Vec<PeerInfo> {
-        let Ok(peers) = self.peers.lock() else {
+    fn peer_infos_from(
+        peers_state: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+        public_addrs: &[SocketAddr],
+    ) -> Vec<PeerInfo> {
+        let Ok(peers) = peers_state.lock() else {
             eprintln!("peer state lock poisoned");
             return Vec::new();
         };
@@ -1435,7 +1541,7 @@ impl NodeService {
                 address: addr.to_string(),
             })
             .collect::<Vec<_>>();
-        for public_addr in &self.config.public_addrs {
+        for public_addr in public_addrs {
             infos.push(PeerInfo {
                 address: public_addr.to_string(),
             });
@@ -1459,11 +1565,42 @@ impl NodeService {
             failed: 0,
         };
         for peer in peers {
-            if let Err(error) = send_message(peer, message.clone()) {
-                report.failed += 1;
-                eprintln!("broadcast to {peer} failed: {error}");
-            } else {
-                report.sent += 1;
+            let result = {
+                let mut connections = match self.peer_connections.lock() {
+                    Ok(connections) => connections,
+                    Err(_) => {
+                        report.failed += 1;
+                        eprintln!("peer connection lock poisoned");
+                        continue;
+                    }
+                };
+                if let Entry::Vacant(entry) = connections.entry(peer) {
+                    match PeerConnection::connect(peer) {
+                        Ok(connection) => {
+                            println!("p2p outbound:: |peer::{peer}|event::connected|");
+                            entry.insert(connection);
+                        }
+                        Err(error) => {
+                            report.failed += 1;
+                            eprintln!("broadcast to {peer} failed: {error}");
+                            continue;
+                        }
+                    }
+                }
+                connections
+                    .get_mut(&peer)
+                    .ok_or_else(|| format!("missing peer connection for {peer}"))
+                    .and_then(|connection| connection.send(message.clone()))
+            };
+            match result {
+                Ok(()) => report.sent += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    if let Ok(mut connections) = self.peer_connections.lock() {
+                        connections.remove(&peer);
+                    }
+                    eprintln!("broadcast to {peer} failed: {error}");
+                }
             }
         }
         report
@@ -1488,6 +1625,20 @@ fn inbound_message_log(message: &NetworkMessage, peer: SocketAddr) -> Option<Str
             transaction.transaction.nonce.0
         )),
         _ => None,
+    }
+}
+
+fn is_peer_stream_closed(error: &NetworkError) -> bool {
+    match error {
+        NetworkError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        ),
+        _ => false,
     }
 }
 
@@ -1814,7 +1965,11 @@ async fn rpc_submit_tx(
         .log_counters
         .accepted_tx_total
         .fetch_add(1, Ordering::Relaxed);
-    let _report = broadcast_to_peers(&state.peers, NetworkMessage::Transaction(transaction));
+    let _report = broadcast_to_peers(
+        &state.peers,
+        &state.peer_connections,
+        NetworkMessage::Transaction(transaction),
+    );
     state
         .log_counters
         .broadcast_tx_total
@@ -2033,6 +2188,7 @@ fn run_node(args: &[String]) -> Result<(), String> {
     let rpc_state = RpcState {
         node,
         peers: service.peers.clone(),
+        peer_connections: service.peer_connections.clone(),
         mining: service.config.mine,
         log_counters,
     };
@@ -2074,8 +2230,12 @@ fn print_core_startup_info() {
 }
 
 fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
+    let args = args
+        .iter()
+        .map(|arg| arg.trim().to_string())
+        .collect::<Vec<_>>();
     let mut config = RunConfig::default();
-    let config_path = config_path_arg(args).unwrap_or(DEFAULT_CONFIG_FILE);
+    let config_path = config_path_arg(&args).unwrap_or(DEFAULT_CONFIG_FILE);
     if let Some(file_config) = load_run_config_file_if_exists(config_path)? {
         apply_run_config_file(&mut config, file_config)?;
     }
@@ -2409,7 +2569,11 @@ fn mine_once_unlocked(
         node.mempool.prune_expired(timestamp);
         let difficulty = node.next_difficulty().map_err(|error| error.to_string())?;
         let mempool_len = node.mempool.len();
-        println!("target::argon2 |difficulty::{}|", difficulty);
+        println!(
+            "pow:: |algo::argon2id|difficulty_bits::{}|target::{}|",
+            difficulty,
+            pow_target_description(difficulty)
+        );
         println!("mempool:: |txs::{}|", mempool_len);
         let candidate = prepare_candidate_block(
             &node.mempool,
@@ -2563,6 +2727,22 @@ fn format_difficulty(difficulty: Result<u32, impl std::fmt::Display>) -> String 
         .unwrap_or_else(|error| format!("error:{error}"))
 }
 
+fn pow_target_description(difficulty: u32) -> String {
+    if difficulty == 0 {
+        return "disabled_for_test".to_string();
+    }
+    let zero_bytes = difficulty / 8;
+    let zero_bits = difficulty % 8;
+    if zero_bits == 0 {
+        format!("hash_prefix_zero_bytes>={zero_bytes}")
+    } else {
+        let mask = 0xff_u8 << (8 - zero_bits);
+        format!(
+            "hash_prefix_zero_bytes>={zero_bytes},next_byte_mask=0x{mask:02x},leading_zero_bits>={difficulty}"
+        )
+    }
+}
+
 fn print_help() {
     println!(
         "\
@@ -2637,4 +2817,46 @@ fn print_libp2p_info() -> Result<(), String> {
     println!("tx_topic: {}", libp2p_node::PAQUS_TX_TOPIC);
     println!("request_protocol: {}", libp2p_node::PAQUS_REQUEST_PROTOCOL);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_run_config_accepts_pasted_flags_with_surrounding_spaces() {
+        let config = parse_run_config(&args(&[
+            "--config",
+            "/tmp/paqus-node-missing-test-config.json",
+            "./data/paqus",
+            " --listen",
+            "0.0.0.0:5555",
+            " --listen",
+            "[::]:5555",
+            " --rpc-listen",
+            "127.0.0.1:6666",
+            " --public-addr",
+            "[2404:8000:1044:4d8:822b:f9ff:fee2:365]:5555",
+            " --peer",
+            "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:5555",
+            " --peer",
+            "182.253.148.123:5555",
+            " --mine",
+            " --mine-attempts",
+            "100000",
+        ]))
+        .expect("pasted flags should parse");
+
+        assert_eq!(config.db_path, "./data/paqus");
+        assert_eq!(config.listen_addrs.len(), 2);
+        assert_eq!(config.peers.len(), 2);
+        assert_eq!(config.public_addrs.len(), 1);
+        assert_eq!(config.rpc_addr, "127.0.0.1:6666".parse().unwrap());
+        assert!(config.mine);
+        assert_eq!(config.mine_attempts, 100000);
+    }
 }

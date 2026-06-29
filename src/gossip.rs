@@ -1,5 +1,4 @@
-use crate::network::send_message;
-use crate::p2p::PeerState;
+use crate::p2p::{PeerConnection, PeerState};
 use crate::paquscore::{BlockHash, NetworkMessage, TransactionHash};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -75,6 +74,7 @@ fn mark_seen<T: Copy + Eq + std::hash::Hash>(
 
 pub fn broadcast_to_peers(
     peers: &Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    peer_connections: &Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
     message: NetworkMessage,
 ) -> BroadcastReport {
     let peers = match peers.lock() {
@@ -91,11 +91,43 @@ pub fn broadcast_to_peers(
         failed: 0,
     };
     for peer in peers {
-        if let Err(error) = send_message(peer, message.clone()) {
-            report.failed += 1;
-            eprintln!("broadcast to {peer} failed: {error}");
-        } else {
-            report.sent += 1;
+        let result = {
+            let mut connections = match peer_connections.lock() {
+                Ok(connections) => connections,
+                Err(_) => {
+                    report.failed += 1;
+                    eprintln!("peer connection lock poisoned");
+                    continue;
+                }
+            };
+            let connect_result = if !connections.contains_key(&peer) {
+                match PeerConnection::connect(peer) {
+                    Ok(connection) => {
+                        println!("p2p outbound:: |peer::{peer}|event::connected|");
+                        connections.insert(peer, connection);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                Ok(())
+            };
+            connect_result.and_then(|()| {
+                connections
+                    .get_mut(&peer)
+                    .ok_or_else(|| format!("missing peer connection for {peer}"))
+                    .and_then(|connection| connection.send(message.clone()))
+            })
+        };
+        match result {
+            Ok(()) => report.sent += 1,
+            Err(error) => {
+                report.failed += 1;
+                if let Ok(mut connections) = peer_connections.lock() {
+                    connections.remove(&peer);
+                }
+                eprintln!("broadcast to {peer} failed: {error}");
+            }
         }
     }
     report
