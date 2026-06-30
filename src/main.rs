@@ -1136,7 +1136,7 @@ impl NodeService {
         let activity = if peer_count == 0 && self.config.gateway_url.is_some() {
             NodeActivity::WaitingForPeers
         } else if pending_sync
-            || (self.requires_peer_sync_before_mining && !self.has_successful_peer_handshake()?)
+            || self.needs_peer_handshake_before_mining()?
             || self.peer_ahead_of_local_tip()?
         {
             NodeActivity::Syncing
@@ -1169,7 +1169,7 @@ impl NodeService {
         if pending_sync {
             return Ok(Some("sync_pending"));
         }
-        if self.requires_peer_sync_before_mining && !self.has_successful_peer_handshake()? {
+        if self.needs_peer_handshake_before_mining()? {
             return Ok(Some("handshake_pending"));
         }
         if self.peer_ahead_of_local_tip()? {
@@ -1178,12 +1178,15 @@ impl NodeService {
         Ok(None)
     }
 
-    fn has_successful_peer_handshake(&self) -> Result<bool, String> {
+    fn needs_peer_handshake_before_mining(&self) -> Result<bool, String> {
+        if !self.requires_peer_sync_before_mining {
+            return Ok(false);
+        }
         let peers = self
             .peers
             .lock()
             .map_err(|_| "peer state lock poisoned".to_string())?;
-        Ok(peers.values().any(|peer| peer.last_tip.is_some()))
+        Ok(!peers.is_empty() && !peers.values().any(|peer| peer.last_tip.is_some()))
     }
 
     fn peer_ahead_of_local_tip(&self) -> Result<bool, String> {
