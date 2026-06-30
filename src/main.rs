@@ -778,6 +778,12 @@ struct BlockResponse {
     miner_address: String,
     difficulty: u32,
     timestamp: u64,
+    age_secs: u64,
+    confirmations: u64,
+    block_time_secs: Option<u64>,
+    target_block_time_secs: u32,
+    block_time_delta_secs: Option<i64>,
+    value_moved: u32,
     nonce: u64,
     tx_count: usize,
     size: usize,
@@ -1788,7 +1794,7 @@ async fn rpc_latest_blocks(State(state): State<RpcState>) -> impl IntoResponse {
             let mut blocks = Vec::new();
             for height in (start..=tip).rev() {
                 match node.storage.load_block_by_height(Height(height)) {
-                    Ok(Some(block)) => blocks.push(block_response(&block, None)),
+                    Ok(Some(block)) => blocks.push(block_response(&node, &block, None)),
                     Ok(None) => {}
                     Err(error) => {
                         return rpc_error(
@@ -1810,7 +1816,7 @@ async fn rpc_block_by_height(
 ) -> impl IntoResponse {
     match state.node.lock() {
         Ok(node) => match node.storage.load_block_by_height(Height(height)) {
-            Ok(Some(block)) => Json(block_response(&block, None)).into_response(),
+            Ok(Some(block)) => Json(block_response(&node, &block, None)).into_response(),
             Ok(None) => rpc_error(StatusCode::NOT_FOUND, "block_not_found"),
             Err(error) => rpc_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1832,7 +1838,7 @@ async fn rpc_block_by_hash(
     let block_hash = BlockHash::from(hash);
     match state.node.lock() {
         Ok(node) => match node.storage.load_block_by_hash(&block_hash) {
-            Ok(Some(block)) => Json(block_response(&block, None)).into_response(),
+            Ok(Some(block)) => Json(block_response(&node, &block, None)).into_response(),
             Ok(None) => rpc_error(StatusCode::NOT_FOUND, "block_not_found"),
             Err(error) => rpc_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1991,10 +1997,22 @@ fn rpc_error(status: StatusCode, error: impl Into<String>) -> axum::response::Re
         .into_response()
 }
 
-fn block_response(block: &Block, status: Option<&'static str>) -> BlockResponse {
+fn block_response(node: &Node, block: &Block, status: Option<&'static str>) -> BlockResponse {
     let block_hash = block.hash();
+    let tip_height = node.tip_height().unwrap_or(Height(0)).0;
+    let height = block.height().0;
+    let now = unix_timestamp().unwrap_or(block.timestamp());
+    let previous_timestamp = height
+        .checked_sub(1)
+        .and_then(|previous_height| {
+            node.storage
+                .load_block_by_height(Height(previous_height))
+                .ok()
+        })
+        .flatten()
+        .map(|previous_block| previous_block.timestamp());
     BlockResponse {
-        height: block.height().0,
+        height,
         hash: hex::encode(block_hash.0),
         short_hash: short_hash(Some(block_hash)),
         previous_hash: hex::encode(block.previous_hash().0),
@@ -2003,6 +2021,19 @@ fn block_response(block: &Block, status: Option<&'static str>) -> BlockResponse 
         miner_address: address_to_string(&block.miner_address()),
         difficulty: block.difficulty(),
         timestamp: block.timestamp(),
+        age_secs: now.saturating_sub(block.timestamp()),
+        confirmations: tip_height.saturating_sub(height).saturating_add(1),
+        block_time_secs: previous_timestamp
+            .map(|timestamp| block.timestamp().saturating_sub(timestamp)),
+        target_block_time_secs: BLOCK_TIME,
+        block_time_delta_secs: previous_timestamp.map(|timestamp| {
+            block.timestamp().saturating_sub(timestamp) as i64 - BLOCK_TIME as i64
+        }),
+        value_moved: block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.transaction.amount.0)
+            .sum(),
         nonce: block.header.nonce.0,
         tx_count: block.transaction_count(),
         size: block.serialized_size(),
