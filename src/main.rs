@@ -786,6 +786,8 @@ struct TxResponse {
     amount: u32,
     fee: u32,
     nonce: u64,
+    timestamp: u64,
+    age_secs: u64,
     block_height: Option<u64>,
     block_hash: Option<String>,
     status: &'static str,
@@ -2235,6 +2237,7 @@ fn tx_response(
     block_hash: Option<Hash>,
     status: &'static str,
 ) -> TxResponse {
+    let now = unix_timestamp().unwrap_or(transaction.transaction.timestamp);
     TxResponse {
         hash: hex::encode(transaction.hash().0),
         from: address_to_string(&transaction.transaction.from),
@@ -2242,6 +2245,8 @@ fn tx_response(
         amount: transaction.transaction.amount.0,
         fee: transaction.transaction.fee.0,
         nonce: transaction.transaction.nonce.0,
+        timestamp: transaction.transaction.timestamp,
+        age_secs: now.saturating_sub(transaction.transaction.timestamp),
         block_height: block_height.map(|height| height.0),
         block_hash: block_hash.map(|hash| hex::encode(hash.0)),
         status,
